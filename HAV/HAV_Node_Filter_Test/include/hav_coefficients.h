@@ -1,0 +1,18 @@
+// hav_coefficients.h
+// Auto-generated from MATLAB
+// Sampling rate: 3200 Hz
+// Format per section: {b0, b1, b2, a1, a2}
+
+#ifndef HAV_COEFFICIENTS_H
+#define HAV_COEFFICIENTS_H
+
+const float FS_HAV = 3200.0f;
+
+const int NUM_SECTIONS_WH = 3;
+const float coeff_wh[NUM_SECTIONS_WH][5] = {
+  {9.913126457328e-01f, -1.982625291466e+00f, 9.913126457328e-01f, -1.982549206447e+00f, 9.827013764839e-01f},
+  {3.578767741404e-01f, 7.157535482807e-01f, 3.578767741404e-01f, 2.471762393794e-01f, 1.843308571820e-01f},
+  {1.548677608063e-02f, 4.765016149668e-04f, -1.501027446567e-02f, -1.951395355291e+00f, 9.523483585214e-01f}
+};
+
+#endif
