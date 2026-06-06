@@ -104,8 +104,12 @@ float sumZ2 = 0.0f;
 
 uint16_t sampleCount = 0;
 
-// Print limiter
-uint32_t lastRawPrintMillis = 0;
+// Simpan raw terakhir per interval 1 detik
+float lastRawX = 0.0f;
+float lastRawY = 0.0f;
+float lastRawZ = 0.0f;
+
+// Error print limiter
 uint32_t lastErrorPrintMillis = 0;
 
 // =======================================================
@@ -326,17 +330,10 @@ void loop() {
       return;
     }
 
-    // Print raw 1 detik sekali
-    if (millis() - lastRawPrintMillis >= 1000) {
-      lastRawPrintMillis = millis();
-
-      Serial.print("RAW ax=");
-      Serial.print(ax, 6);
-      Serial.print(", ay=");
-      Serial.print(ay, 6);
-      Serial.print(", az=");
-      Serial.println(az, 6);
-    }
+    // Simpan raw terakhir dalam interval ini
+    lastRawX = ax;
+    lastRawY = ay;
+    lastRawZ = az;
 
     // ===================================================
     // Frequency weighting WBV
@@ -368,7 +365,16 @@ void loop() {
         powf(1.0f * awz, 2.0f)
       );
 
-      Serial.print("WBV RMS: ");
+      // Print RAW dan RMS dalam satu baris
+      Serial.print("RAW: ");
+      Serial.print("ax=");
+      Serial.print(lastRawX, 6);
+      Serial.print(", ay=");
+      Serial.print(lastRawY, 6);
+      Serial.print(", az=");
+      Serial.print(lastRawZ, 6);
+
+      Serial.print(" | WBV RMS: ");
       Serial.print("awx=");
       Serial.print(awx, 6);
       Serial.print(", awy=");

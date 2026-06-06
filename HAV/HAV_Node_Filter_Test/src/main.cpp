@@ -103,8 +103,12 @@ float sumZ2 = 0.0f;
 
 uint16_t sampleCount = 0;
 
-// Print limiter
-uint32_t lastRawPrintMillis = 0;
+// Simpan raw terakhir per interval 1 detik
+float lastRawX = 0.0f;
+float lastRawY = 0.0f;
+float lastRawZ = 0.0f;
+
+// Error print limiter
 uint32_t lastErrorPrintMillis = 0;
 
 // =======================================================
@@ -324,17 +328,10 @@ void loop() {
       return;
     }
 
-    // Print raw data 1 detik sekali
-    if (millis() - lastRawPrintMillis >= 1000) {
-      lastRawPrintMillis = millis();
-
-      Serial.print("RAW ax=");
-      Serial.print(ax, 6);
-      Serial.print(", ay=");
-      Serial.print(ay, 6);
-      Serial.print(", az=");
-      Serial.println(az, 6);
-    }
+    // Simpan raw terakhir dalam interval ini
+    lastRawX = ax;
+    lastRawY = ay;
+    lastRawZ = az;
 
     // Masuk filter Wh
     float axWh = filterX.process(ax);
@@ -348,6 +345,7 @@ void loop() {
 
     sampleCount++;
 
+    // Setelah 3200 sampel = sekitar 1 detik
     if (sampleCount >= 3200) {
       float ahwx = sqrtf(sumX2 / sampleCount);
       float ahwy = sqrtf(sumY2 / sampleCount);
@@ -359,7 +357,16 @@ void loop() {
         ahwz * ahwz
       );
 
-      Serial.print("HAV RMS: ");
+      // Print RAW dan RMS dalam satu baris yang sama
+      Serial.print("RAW: ");
+      Serial.print("ax=");
+      Serial.print(lastRawX, 6);
+      Serial.print(", ay=");
+      Serial.print(lastRawY, 6);
+      Serial.print(", az=");
+      Serial.print(lastRawZ, 6);
+
+      Serial.print(" | HAV RMS: ");
       Serial.print("ahwx=");
       Serial.print(ahwx, 6);
       Serial.print(", ahwy=");
@@ -369,6 +376,7 @@ void loop() {
       Serial.print(", ahv=");
       Serial.println(ahv, 6);
 
+      // Reset accumulator untuk interval berikutnya
       sumX2 = 0.0f;
       sumY2 = 0.0f;
       sumZ2 = 0.0f;
