@@ -550,6 +550,7 @@ static void vTaskWBVAcquisition(void *pvParameters) {
                 }
 
                 LOG_I(TAG, "RAW ax=%.3f ay=%.3f az=%.3f | awx=%.4f awy=%.4f awz=%.4f av=%.4f",
+                      result.timestamp,
                       result.rawAx, result.rawAy, result.rawAz,
                       result.awx, result.awy, result.awz, result.av);
 
