@@ -1,5 +1,11 @@
 #include <Arduino.h>
 #include <Wire.h>
+
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
 #include "hav_coefficients.h"
 
 // =======================================================
@@ -16,9 +22,47 @@
 
 #define ADXL345_DEVID_VALUE  0xE5
 
-// ADXL345 detected address
+// ADXL345 config
+#define ADXL_BW_3200HZ       0x0F
+#define ADXL_FORMAT_FULLRES_16G 0x0B
+
+#define ADXL_SCALE_G_PER_LSB 0.0039f
+#define G_TO_MPS2            9.80665f
+
+// =======================================================
+// I2C Pin
+// =======================================================
+#define PIN_I2C_SDA          21
+#define PIN_I2C_SCL          22
+
+// =======================================================
+// BLE UUID
+// Main Unit nanti subscribe ke characteristic ini
+// =======================================================
+#define BLE_DEVICE_NAME      "HAV_NODE"
+#define BLE_SERVICE_UUID     "9b6f0001-5f5a-4f0d-9d7f-000000000001"
+#define BLE_CHAR_UUID_HAV    "9b6f0002-5f5a-4f0d-9d7f-000000000002"
+
+// =======================================================
+// Sampling HAV
+// =======================================================
+const float FS = FS_HAV;   // 3200 Hz dari hav_coefficients.h
+
+// 1 / 3200 = 312.5 us
+// Pakai x100 supaya bisa represent 312.5 us sebagai 31250
+const uint32_t SAMPLE_PERIOD_US_X100 = 31250;
+const uint16_t HAV_EPOCH_SAMPLES = 3200;
+
+// =======================================================
+// Global state
+// =======================================================
 uint8_t adxlAddress = 0x00;
 bool adxlAvailable = false;
+
+BLECharacteristic *havCharacteristic = nullptr;
+bool bleClientConnected = false;
+
+uint32_t packetCounter = 0;
 
 // =======================================================
 // Biquad Cascade Filter
@@ -26,6 +70,8 @@ bool adxlAvailable = false;
 // =======================================================
 class BiquadCascade {
 public:
+  static const int MAX_SECTIONS = 4;
+
   BiquadCascade(const float (*coeff)[5], int sections) {
     this->coeff = coeff;
     this->sections = sections;
@@ -67,8 +113,6 @@ public:
   }
 
 private:
-  static const int MAX_SECTIONS = 4;
-
   const float (*coeff)[5];
   int sections;
 
@@ -78,41 +122,13 @@ private:
   float y2[MAX_SECTIONS];
 };
 
-// =======================================================
-// Filter Wh untuk HAV
-// =======================================================
+// Wh untuk semua sumbu HAV
 BiquadCascade filterX(coeff_wh, NUM_SECTIONS_WH);
 BiquadCascade filterY(coeff_wh, NUM_SECTIONS_WH);
 BiquadCascade filterZ(coeff_wh, NUM_SECTIONS_WH);
 
 // =======================================================
-// Sampling
-// =======================================================
-const float FS = FS_HAV;   // 3200 Hz dari hav_coefficients.h
-
-// 1/3200 s = 312.5 us
-// Supaya 312.5 us bisa presisi, pakai skala x100
-const uint32_t SAMPLE_PERIOD_US_X100 = 31250;
-
-uint64_t nextSampleTimeUsX100 = 0;
-
-// RMS accumulator
-float sumX2 = 0.0f;
-float sumY2 = 0.0f;
-float sumZ2 = 0.0f;
-
-uint16_t sampleCount = 0;
-
-// Simpan raw terakhir per interval 1 detik
-float lastRawX = 0.0f;
-float lastRawY = 0.0f;
-float lastRawZ = 0.0f;
-
-// Error print limiter
-uint32_t lastErrorPrintMillis = 0;
-
-// =======================================================
-// I2C helper functions
+// I2C Helper
 // =======================================================
 bool writeRegister(uint8_t addr, uint8_t reg, uint8_t value) {
   Wire.beginTransmission(addr);
@@ -167,7 +183,7 @@ bool readMultipleRegisters(uint8_t addr, uint8_t startReg, uint8_t *buffer, uint
 }
 
 // =======================================================
-// Scan ADXL345 address
+// ADXL345 Detect + Init
 // =======================================================
 bool detectADXL345() {
   uint8_t devid = 0;
@@ -190,36 +206,29 @@ bool detectADXL345() {
   return false;
 }
 
-// =======================================================
-// Init ADXL345
-// =======================================================
 bool setupADXL345() {
-  Wire.begin(21, 22);       // SDA = GPIO21, SCL = GPIO22
-  Wire.setClock(100000);    // 100 kHz dulu untuk deteksi
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  Wire.setClock(100000);
 
   if (!detectADXL345()) {
     return false;
   }
 
-  Serial.print("ADXL345 terdeteksi di address 0x");
+  Serial.print("ADXL345 HAV terdeteksi di address 0x");
   Serial.println(adxlAddress, HEX);
 
-  // Standby dulu
+  // Standby
   if (!writeRegister(adxlAddress, REG_POWER_CTL, 0x00)) {
     return false;
   }
 
-  // Data rate 3200 Hz
-  // BW_RATE = 0x0F untuk 3200 Hz
-  if (!writeRegister(adxlAddress, REG_BW_RATE, 0x0F)) {
+  // Output data rate 3200 Hz
+  if (!writeRegister(adxlAddress, REG_BW_RATE, ADXL_BW_3200HZ)) {
     return false;
   }
 
-  // DATA_FORMAT:
-  // bit 3 FULL_RES = 1
-  // range +/-16g = 0x03
-  // 0x08 | 0x03 = 0x0B
-  if (!writeRegister(adxlAddress, REG_DATA_FORMAT, 0x0B)) {
+  // Full resolution, range +/-16g
+  if (!writeRegister(adxlAddress, REG_DATA_FORMAT, ADXL_FORMAT_FULLRES_16G)) {
     return false;
   }
 
@@ -228,20 +237,15 @@ bool setupADXL345() {
     return false;
   }
 
-  // Naikkan speed I2C setelah sensor terdeteksi
   Wire.setClock(400000);
 
-  Serial.println("ADXL345 setup selesai.");
+  Serial.println("ADXL345 HAV setup selesai.");
   Serial.println("Range    : +/-16g full resolution");
   Serial.println("DataRate : 3200 Hz");
 
   return true;
 }
 
-// =======================================================
-// Read ADXL345 raw acceleration
-// Output: m/s^2
-// =======================================================
 bool readADXL345(float &ax, float &ay, float &az) {
   if (!adxlAvailable) {
     return false;
@@ -257,15 +261,95 @@ bool readADXL345(float &ax, float &ay, float &az) {
   int16_t rawY = (int16_t)((data[3] << 8) | data[2]);
   int16_t rawZ = (int16_t)((data[5] << 8) | data[4]);
 
-  // ADXL345 full-resolution scale ≈ 3.9 mg/LSB
-  const float SCALE_G_PER_LSB = 0.0039f;
-  const float G_TO_MPS2 = 9.80665f;
-
-  ax = rawX * SCALE_G_PER_LSB * G_TO_MPS2;
-  ay = rawY * SCALE_G_PER_LSB * G_TO_MPS2;
-  az = rawZ * SCALE_G_PER_LSB * G_TO_MPS2;
+  ax = rawX * ADXL_SCALE_G_PER_LSB * G_TO_MPS2;
+  ay = rawY * ADXL_SCALE_G_PER_LSB * G_TO_MPS2;
+  az = rawZ * ADXL_SCALE_G_PER_LSB * G_TO_MPS2;
 
   return true;
+}
+
+// =======================================================
+// BLE Callback
+// =======================================================
+class HavBleServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *server) override {
+    bleClientConnected = true;
+    Serial.println("BLE client connected.");
+  }
+
+  void onDisconnect(BLEServer *server) override {
+    bleClientConnected = false;
+    Serial.println("BLE client disconnected. Restart advertising.");
+    server->getAdvertising()->start();
+  }
+};
+
+// =======================================================
+// BLE Setup
+// =======================================================
+void setupBLE() {
+  BLEDevice::init(BLE_DEVICE_NAME);
+
+  BLEServer *server = BLEDevice::createServer();
+  server->setCallbacks(new HavBleServerCallbacks());
+
+  BLEService *service = server->createService(BLE_SERVICE_UUID);
+
+  havCharacteristic = service->createCharacteristic(
+    BLE_CHAR_UUID_HAV,
+    BLECharacteristic::PROPERTY_READ |
+    BLECharacteristic::PROPERTY_NOTIFY
+  );
+
+  havCharacteristic->addDescriptor(new BLE2902());
+
+  // Initial value
+  havCharacteristic->setValue("HAV,0,0,0,0,0,0,0");
+
+  service->start();
+
+  BLEAdvertising *advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
+  advertising->start();
+
+  Serial.println("BLE HAV Node advertising started.");
+}
+
+// =======================================================
+// Send HAV packet
+// Format:
+// HAV,seq,millis_ms,ahwx,ahwy,ahwz,ahv,n_samples
+// =======================================================
+void sendHavBlePacket(float ahwx, float ahwy, float ahwz, float ahv, uint16_t nSamples) {
+  char payload[128];
+
+  uint32_t nowMs = millis();
+
+  snprintf(payload, sizeof(payload),
+           "HAV,%lu,%lu,%.6f,%.6f,%.6f,%.6f,%u",
+           packetCounter,
+           nowMs,
+           ahwx,
+           ahwy,
+           ahwz,
+           ahv,
+           nSamples);
+
+  // Serial tetap print meskipun belum connect BLE
+  Serial.println(payload);
+
+  if (havCharacteristic != nullptr) {
+    havCharacteristic->setValue(payload);
+
+    if (bleClientConnected) {
+      havCharacteristic->notify();
+    }
+  }
+
+  packetCounter++;
 }
 
 // =======================================================
@@ -277,35 +361,52 @@ void setup() {
 
   Serial.println();
   Serial.println("=================================");
-  Serial.println("HAV Node ADXL345 + Wh Filter");
+  Serial.println("HAV Node ESP32");
+  Serial.println("ADXL345 + Wh Filter + BLE TX");
+  Serial.println("No RTC, no SD, no OLED");
   Serial.println("=================================");
 
   adxlAvailable = setupADXL345();
 
   if (!adxlAvailable) {
-    Serial.println("ERROR: ADXL345 tidak terdeteksi.");
+    Serial.println("ERROR: ADXL345 HAV tidak terdeteksi.");
     Serial.println("Cek wiring:");
     Serial.println("VCC -> 3V3");
     Serial.println("GND -> GND");
-    Serial.println("SDA -> GPIO21 / D21");
-    Serial.println("SCL -> GPIO22 / D22");
+    Serial.println("SDA -> GPIO21");
+    Serial.println("SCL -> GPIO22");
     Serial.println("CS  -> 3V3");
     Serial.println("SDO -> GND atau 3V3");
-    Serial.println();
-    Serial.println("Program tetap jalan, tapi tidak akan memfilter data palsu.");
   }
 
-  Serial.print("Sampling rate filter HAV = ");
+  setupBLE();
+
+  Serial.print("Sampling rate HAV = ");
   Serial.print(FS);
   Serial.println(" Hz");
 
-  nextSampleTimeUsX100 = (uint64_t)micros() * 100ULL + SAMPLE_PERIOD_US_X100;
+  Serial.println("Payload BLE:");
+  Serial.println("HAV,seq,millis_ms,ahwx,ahwy,ahwz,ahv,n_samples");
 }
 
 // =======================================================
 // Loop
 // =======================================================
 void loop() {
+  static uint64_t nextSampleTimeUsX100 =
+    (uint64_t)micros() * 100ULL + SAMPLE_PERIOD_US_X100;
+
+  static float sumX2 = 0.0f;
+  static float sumY2 = 0.0f;
+  static float sumZ2 = 0.0f;
+  static uint16_t sampleCount = 0;
+
+  static float lastRawX = 0.0f;
+  static float lastRawY = 0.0f;
+  static float lastRawZ = 0.0f;
+
+  static uint32_t lastErrorPrintMs = 0;
+
   uint64_t nowUsX100 = (uint64_t)micros() * 100ULL;
 
   if (nowUsX100 >= nextSampleTimeUsX100) {
@@ -314,12 +415,10 @@ void loop() {
     float ax, ay, az;
 
     if (!readADXL345(ax, ay, az)) {
-      if (millis() - lastErrorPrintMillis >= 1000) {
-        lastErrorPrintMillis = millis();
+      if (millis() - lastErrorPrintMs >= 1000) {
+        lastErrorPrintMs = millis();
+        Serial.println("ADXL345 HAV tidak terbaca. Sampel dilewati.");
 
-        Serial.println("ADXL345 tidak terbaca. Sampel dilewati.");
-
-        // Coba deteksi ulang kalau sensor baru dipasang
         Wire.setClock(100000);
         adxlAvailable = setupADXL345();
         Wire.setClock(400000);
@@ -328,25 +427,22 @@ void loop() {
       return;
     }
 
-    // Simpan raw terakhir dalam interval ini
     lastRawX = ax;
     lastRawY = ay;
     lastRawZ = az;
 
-    // Masuk filter Wh
+    // Wh filter untuk semua sumbu HAV
     float axWh = filterX.process(ax);
     float ayWh = filterY.process(ay);
     float azWh = filterZ.process(az);
 
-    // Akumulasi RMS
     sumX2 += axWh * axWh;
     sumY2 += ayWh * ayWh;
     sumZ2 += azWh * azWh;
-
     sampleCount++;
 
-    // Setelah 3200 sampel = sekitar 1 detik
-    if (sampleCount >= 3200) {
+    // Per 1 detik: 3200 sampel
+    if (sampleCount >= HAV_EPOCH_SAMPLES) {
       float ahwx = sqrtf(sumX2 / sampleCount);
       float ahwy = sqrtf(sumY2 / sampleCount);
       float ahwz = sqrtf(sumZ2 / sampleCount);
@@ -357,7 +453,6 @@ void loop() {
         ahwz * ahwz
       );
 
-      // Print RAW dan RMS dalam satu baris yang sama
       Serial.print("RAW: ");
       Serial.print("ax=");
       Serial.print(lastRawX, 6);
@@ -365,18 +460,10 @@ void loop() {
       Serial.print(lastRawY, 6);
       Serial.print(", az=");
       Serial.print(lastRawZ, 6);
+      Serial.print(" | ");
 
-      Serial.print(" | HAV RMS: ");
-      Serial.print("ahwx=");
-      Serial.print(ahwx, 6);
-      Serial.print(", ahwy=");
-      Serial.print(ahwy, 6);
-      Serial.print(", ahwz=");
-      Serial.print(ahwz, 6);
-      Serial.print(", ahv=");
-      Serial.println(ahv, 6);
+      sendHavBlePacket(ahwx, ahwy, ahwz, ahv, sampleCount);
 
-      // Reset accumulator untuk interval berikutnya
       sumX2 = 0.0f;
       sumY2 = 0.0f;
       sumZ2 = 0.0f;
