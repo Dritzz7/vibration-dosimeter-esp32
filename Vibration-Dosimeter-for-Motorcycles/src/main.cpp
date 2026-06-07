@@ -54,9 +54,10 @@
 #include <Adafruit_SSD1306.h>  // Adafruit SSD1306 OLED driver
 
 // =============================================================================
-// DEBUG LOGGING — Set DEBUG_ENABLED 0 to silence all serial output in production
+// DEBUG & SIMULATION CONFIGURATION
 // =============================================================================
-#define DEBUG_ENABLED  1
+#define DEBUG_ENABLED      1
+#define SIMULATE_HAV_DATA  1  // 1 = Mock HAV data & bypass self-test, 0 = Read from physical sensor
 
 #if DEBUG_ENABLED
   #define LOG_I(tag, fmt, ...)  Serial.printf("[INFO][%s] " fmt "\n", tag, ##__VA_ARGS__)
@@ -471,11 +472,20 @@ static void vTaskHAVAcquisition(void *pvParameters) {
 
         if (!havSensorOK) continue;
 
-        // ── Sensor Read ───────────────────────────────────────────────────────
+        // ── Sensor Read or Simulation ─────────────────────────────────────────
         float ax = 0.0f, ay = 0.0f, az = 0.0f;
+#if SIMULATE_HAV_DATA
+        // Generate mock hand-arm vibration data (combination of sines representing motor/handlebar frequencies)
+        static float simTime = 0.0f;
+        simTime += 0.0005f; // dt for 2000 Hz
+        ax = 2.5f * sinf(2.0f * PI * 15.0f * simTime) + 1.0f * sinf(2.0f * PI * 80.0f * simTime);
+        ay = 1.8f * cosf(2.0f * PI * 18.0f * simTime) + 0.5f * sinf(2.0f * PI * 120.0f * simTime);
+        az = 3.0f * sinf(2.0f * PI * 25.0f * simTime) + 0.2f * cosf(2.0f * PI * 150.0f * simTime);
+#else
         if (!adxl345_read(ADXL345_ADDR_HAV, ax, ay, az)) {
             continue;
         }
+#endif
 
         // ── Wh Frequency Weighting (ISO 8041 Biquad Cascade) ─────────────────
         const float axWh = filterHAV_X.process(ax);
@@ -914,6 +924,10 @@ static void runSelfTest() {
     Wire.setClock(100000); // Start at 100 kHz for detection
 
     // HAV ADXL345
+#if SIMULATE_HAV_DATA
+    havSensorOK = true;
+    LOG_I("INIT", "HAV ADXL345 is simulated (SIMULATE_HAV_DATA=1)");
+#else
     havSensorOK = adxl345_detect(ADXL345_ADDR_HAV);
     if (havSensorOK) {
         havSensorOK = adxl345_init(ADXL345_ADDR_HAV, ADXL_BW_3200HZ);
@@ -921,6 +935,7 @@ static void runSelfTest() {
     } else {
         LOG_E("INIT", "HAV ADXL345 @ 0x%02X NOT FOUND", ADXL345_ADDR_HAV);
     }
+#endif
 
     // WBV ADXL345
     wbvSensorOK = adxl345_detect(ADXL345_ADDR_WBV);
