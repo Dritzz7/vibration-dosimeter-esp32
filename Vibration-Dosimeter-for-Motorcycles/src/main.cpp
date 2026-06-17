@@ -229,6 +229,7 @@ static volatile SystemState_t systemState = SYS_INIT;
 // Sensor availability flags (written once in setup, read-only afterwards)
 static bool havSensorOK = false;
 static bool wbvSensorOK = false;
+static uint8_t actual_wbv_addr = 0x00;
 static bool rtcOK       = false;
 static bool sdOK        = false;
 static bool oledOK      = false;
@@ -578,7 +579,7 @@ static void vTaskWBVAcquisition(void *pvParameters) {
 
         // ── Sensor Read ───────────────────────────────────────────────────────
         float ax = 0.0f, ay = 0.0f, az = 0.0f;
-        if (!adxl345_read(ADXL345_ADDR_WBV, ax, ay, az)) {
+        if (!adxl345_read(actual_wbv_addr, ax, ay, az)) {
             continue;
         }
 
@@ -937,13 +938,21 @@ static void runSelfTest() {
     }
 #endif
 
-    // WBV ADXL345
-    wbvSensorOK = adxl345_detect(ADXL345_ADDR_WBV);
-    if (wbvSensorOK) {
-        wbvSensorOK = adxl345_init(ADXL345_ADDR_WBV, ADXL_BW_400HZ);
-        LOG_I("INIT", "WBV ADXL345 @ 0x%02X init %s", ADXL345_ADDR_WBV, wbvSensorOK ? "OK" : "FAIL");
+    // WBV ADXL345 Auto-Detect (0x53 or 0x1D)
+    if (adxl345_detect(0x53)) {
+        actual_wbv_addr = 0x53;
+        wbvSensorOK = adxl345_init(actual_wbv_addr, ADXL_BW_400HZ);
+    } else if (adxl345_detect(0x1D)) {
+        actual_wbv_addr = 0x1D;
+        wbvSensorOK = adxl345_init(actual_wbv_addr, ADXL_BW_400HZ);
     } else {
-        LOG_E("INIT", "WBV ADXL345 @ 0x%02X NOT FOUND", ADXL345_ADDR_WBV);
+        wbvSensorOK = false;
+    }
+
+    if (wbvSensorOK) {
+        LOG_I("INIT", "WBV ADXL345 @ 0x%02X init OK", actual_wbv_addr);
+    } else {
+        LOG_E("INIT", "WBV ADXL345 NOT FOUND (checked 0x53 and 0x1D)");
     }
 
     // DS3231 RTC Self-Test
@@ -954,9 +963,19 @@ static void runSelfTest() {
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     }
 
-    // SD Card Self-Test
+    // SD Card Self-Test (with hardware mitigation for problematic modules)
+    pinMode(PIN_SD_CS, OUTPUT);
+    digitalWrite(PIN_SD_CS, HIGH);
+    pinMode(PIN_SPI_MISO, INPUT_PULLUP); // Helps with long jumper wires
+    
     SPI.begin(PIN_SPI_CLK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_SD_CS);
-    sdOK = SD.begin(PIN_SD_CS);
+    
+    // Try explicit 4 MHz first, fallback to 1 MHz if it fails
+    sdOK = SD.begin(PIN_SD_CS, SPI, 4000000);
+    if (!sdOK) {
+        LOG_W("INIT", "SD init failed at 4MHz, retrying at 1MHz...");
+        sdOK = SD.begin(PIN_SD_CS, SPI, 1000000);
+    }
     LOG_I("INIT", "SD Card init %s", sdOK ? "OK" : "FAIL");
 
     // OLED Init
