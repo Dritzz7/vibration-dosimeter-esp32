@@ -1,34 +1,36 @@
 /**
  * @file    main.cpp
- * @brief   Vibration Dosimeter ESP32 — FreeRTOS Dual-Core Firmware Framework
+ * @brief   Vibration Dosimeter ESP32 — Main Unit Firmware (FreeRTOS Dual-Core)
  *
  * @details Simultaneous Hand-Arm Vibration (HAV) and Whole-Body Vibration (WBV)
  *          measurement system conforming to ISO 5349-1 (HAV) and ISO 2631-1 (WBV).
  *
  *          ┌──────────────────────────────────────────────────────────────────┐
  *          │  CORE 0  (PRO_CPU) — Real-Time Acquisition & DSP                 │
- *          │   • vTaskHAVAcquisition  — 2000 Hz, Priority 5                   │
  *          │   • vTaskWBVAcquisition  — 200 Hz,  Priority 4                   │
  *          ├──────────────────────────────────────────────────────────────────┤
- *          │  CORE 1  (APP_CPU) — Logging, HMI & Peripheral Management        │
- *          │   • vTaskDataLogger      — 1 Hz,    Priority 3                   │
- *          │   • vTaskHMIAndController— 10 Hz,   Priority 2                   │
+ *          │  CORE 1  (APP_CPU) — Logging, HMI & BLE Management               │
+ *          │   • vTaskBLEReceiver     — event-driven, Priority 3              │
+ *          │   • vTaskDataLogger      — 1 Hz,    Priority 2                   │
+ *          │   • vTaskHMIAndController— 10 Hz,   Priority 1                   │
  *          └──────────────────────────────────────────────────────────────────┘
  *
- *          Filter coefficients are auto-generated from MATLAB (ISO 8041).
- *          HAV: Wh weighting, fs=3200 Hz, 3 biquad sections (used at 2000 Hz stride).
+ *          HAV data is received wirelessly from the HAV Node (Darren) via BLE.
+ *          The HAV Node acts as BLE Server (GATT Peripheral); this unit is BLE
+ *          Client (GATT Central). Payload format: "HAV,seq,millis,ahwx,ahwy,ahwz,ahv,n"
+ *
  *          WBV: Wd(X,Y)/Wk(Z) weighting, fs=400 Hz, 3 & 4 biquad sections.
  *
  * @note    Target Hardware : ESP32 Dual-Core (240 MHz)
  *          Framework       : Arduino Core + FreeRTOS
- *          HAV Sensor      : ADXL345 (I2C, addr 0x53 or 0x1D), 3200 Hz ODR
- *          WBV Sensor      : ADXL345 (I2C, secondary bus or address), 400 Hz ODR
+ *          HAV Data Source : BLE from HAV Node ("HAV_NODE" device name)
+ *          WBV Sensor      : ADXL345 (I2C, auto-detect 0x53 or 0x1D), 400 Hz ODR
  *          RTC             : DS3231 (I2C)
  *          Storage         : SD Card (SPI)
  *          Display         : SSD1306 1.3" OLED (I2C)
  *
  * @author  Team EL4060
- * @date    2026-06-06
+ * @date    2026-06-17
  */
 
 // =============================================================================
@@ -44,20 +46,28 @@
 #include <freertos/timers.h>
 #include <math.h>
 
+// BLE Client (ESP32 built-in Bluetooth stack)
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEClient.h>
+#include <BLERemoteCharacteristic.h>
+#include <BLEAdvertisedDevice.h>
+
 // Project filter coefficient headers (MATLAB-generated, ISO 8041)
-#include "hav_coefficients.h"
 #include "wbv_coefficients.h"
 
 // Third-party library headers — installed via platformio.ini lib_deps
-#include <RTClib.h>         // Adafruit RTClib for DS3231
-#include <SD.h>             // Arduino SD library
-#include <Adafruit_SSD1306.h>  // Adafruit SSD1306 OLED driver
+#include <RTClib.h>             // Adafruit RTClib for DS3231
+#include <SD.h>                 // Arduino SD library
+#include <Adafruit_SSD1306.h>   // Adafruit SSD1306 OLED driver
 
 // =============================================================================
-// DEBUG & SIMULATION CONFIGURATION
+// DEBUG & BLE CONFIGURATION
 // =============================================================================
 #define DEBUG_ENABLED      1
-#define SIMULATE_HAV_DATA  1  // 1 = Mock HAV data & bypass self-test, 0 = Read from physical sensor
+#define USE_BLE_HAV        0   // 1 = Receive HAV RMS from HAV Node via BLE (production)
+                               // 0 = No HAV data (WBV-only mode, for bench testing)
 
 #if DEBUG_ENABLED
   #define LOG_I(tag, fmt, ...)  Serial.printf("[INFO][%s] " fmt "\n", tag, ##__VA_ARGS__)
@@ -86,9 +96,17 @@
 #define PIN_BUTTON            4   // Tactile push-button (active-low, internal pull-up)
 #define PIN_LED_STATUS        2   // On-board LED for status indication
 
-// --- ADXL345 I2C Addresses ---
-#define ADXL345_ADDR_HAV     0x53   // HAV sensor (SDO tied to GND)
+// --- ADXL345 I2C Addresses (WBV only) ---
 #define ADXL345_ADDR_WBV     0x1D   // WBV sensor (SDO tied to 3V3)
+
+// =============================================================================
+// BLE CLIENT CONFIGURATION (must match HAV Node firmware by Darren)
+// =============================================================================
+#define BLE_HAV_DEVICE_NAME  "HAV_NODE"
+#define BLE_SERVICE_UUID     "9b6f0001-5f5a-4f0d-9d7f-000000000001"
+#define BLE_CHAR_UUID_HAV    "9b6f0002-5f5a-4f0d-9d7f-000000000002"
+#define BLE_SCAN_DURATION_S  5      // Scan window per attempt (seconds)
+#define BLE_RECONNECT_MS     5000   // Wait between reconnect attempts
 
 // --- DS3231 I2C Address ---
 #define DS3231_ADDR          0x68
@@ -115,10 +133,7 @@
 // =============================================================================
 // SAMPLING & TIMING CONSTANTS
 // =============================================================================
-// HAV task: target 2000 Hz (every 500 µs). Epoch = 1 second = 2000 samples.
-#define HAV_SAMPLE_RATE_HZ   2000U
-#define HAV_PERIOD_MS        1U                              // ~500µs → 1ms tick granularity
-#define HAV_EPOCH_SAMPLES    (HAV_SAMPLE_RATE_HZ * 1U)      // 2000 samples per 1-s epoch
+// HAV: epochs arrive over BLE from HAV Node (~1 per second)
 
 // WBV task: target 200 Hz (every 5 ms). Epoch = 1 second = 200 samples.
 #define WBV_SAMPLE_RATE_HZ   200U
@@ -139,20 +154,20 @@
 // =============================================================================
 // RTOS CONFIGURATION
 // =============================================================================
-#define TASK_STACK_HAV       4096U
 #define TASK_STACK_WBV       4096U
+#define TASK_STACK_BLE       8192U   // BLE stack needs extra heap
 #define TASK_STACK_LOGGER    8192U   // Larger — handles file I/O
 #define TASK_STACK_HMI       4096U
 
-#define TASK_PRIO_HAV        5
 #define TASK_PRIO_WBV        4
-#define TASK_PRIO_LOGGER     3
-#define TASK_PRIO_HMI        2
+#define TASK_PRIO_BLE        3       // BLE Receiver (event-driven, Core 1)
+#define TASK_PRIO_LOGGER     2
+#define TASK_PRIO_HMI        1
 
-#define CORE_DSP             0       // PRO_CPU — Acquisition & DSP
-#define CORE_PERIPHERAL      1       // APP_CPU — Logging & HMI
+#define CORE_DSP             0       // PRO_CPU — WBV Acquisition & DSP
+#define CORE_PERIPHERAL      1       // APP_CPU — BLE, Logging & HMI
 
-#define QUEUE_HAV_LENGTH     8U      // Buffer up to 8 one-second RMS results
+#define QUEUE_HAV_LENGTH     8U      // Buffer up to 8 BLE-received HAV epochs
 #define QUEUE_WBV_LENGTH     8U
 
 // =============================================================================
@@ -203,7 +218,7 @@ typedef enum {
 // =============================================================================
 
 // Task handles
-static TaskHandle_t  hTaskHAV     = nullptr;
+static TaskHandle_t  hTaskBLE     = nullptr;   // BLE Receiver (replaces local HAV ACQ)
 static TaskHandle_t  hTaskWBV     = nullptr;
 static TaskHandle_t  hTaskLogger  = nullptr;
 static TaskHandle_t  hTaskHMI     = nullptr;
@@ -226,13 +241,16 @@ static SemaphoreHandle_t xMutexState = nullptr;
 // =============================================================================
 static volatile SystemState_t systemState = SYS_INIT;
 
-// Sensor availability flags (written once in setup, read-only afterwards)
-static bool havSensorOK = false;
-static bool wbvSensorOK = false;
+// Sensor/peripheral availability flags
+static bool wbvSensorOK  = false;
 static uint8_t actual_wbv_addr = 0x00;
-static bool rtcOK       = false;
-static bool sdOK        = false;
-static bool oledOK      = false;
+static bool rtcOK        = false;
+static bool sdOK         = false;
+static bool oledOK       = false;
+
+// BLE connection status (volatile: written by BLE callback on Core 1, read by HMI)
+static volatile bool bleConnected   = false;   // true = HAV Node BLE link is up
+static volatile bool bleHavDataOK   = false;   // true = at least one valid packet received
 
 // Global driver instances
 static RTC_DS3231 rtc;
@@ -420,110 +438,208 @@ static void setSystemState(SystemState_t newState) {
 }
 
 // =============================================================================
-// TASK: vTaskHAVAcquisition
-// Core 0 | Priority 5 | Period ~500 µs (2000 Hz)
+// BLE CLIENT — Scan Callback & Notification Callback
+// =============================================================================
+
+// Forward declarations for BLE objects (defined below)
+static BLEClient            *pBleClient          = nullptr;
+static BLERemoteCharacteristic *pHavCharacteristic = nullptr;
+static BLEAdvertisedDevice  *pFoundDevice        = nullptr;
+static bool                  doConnect            = false;
+static bool                  doScan               = false;
+
+/**
+ * @brief  Parse HAV BLE CSV payload and push to xQueueHAVData.
+ *
+ *         Expected format from Darren's HAV Node:
+ *         "HAV,<seq>,<millis_ms>,<ahwx>,<ahwy>,<ahwz>,<ahv>,<n_samples>"
+ */
+static void parseAndEnqueueHavPayload(const char *payload) {
+    // Tokenise using sscanf for speed (no heap allocation)
+    uint32_t seq      = 0;
+    uint32_t millisMs = 0;
+    float    ahwx     = 0.0f;
+    float    ahwy     = 0.0f;
+    float    ahwz     = 0.0f;
+    float    ahv      = 0.0f;
+    uint32_t nSamples = 0;
+
+    // Expected: "HAV,%lu,%lu,%f,%f,%f,%f,%u"
+    int parsed = sscanf(payload,
+                        "HAV,%lu,%lu,%f,%f,%f,%f,%lu",
+                        &seq, &millisMs, &ahwx, &ahwy, &ahwz, &ahv, &nSamples);
+
+    if (parsed != 7) {
+        LOG_W("BLE_RX", "Bad HAV payload (parsed=%d): %s", parsed, payload);
+        return;
+    }
+
+    HavRmsData_t result;
+    result.ahwx     = ahwx;
+    result.ahwy     = ahwy;
+    result.ahwz     = ahwz;
+    result.ahv      = ahv;
+    result.n_samples = nSamples;
+    // Stamp with local RTC (authoritative time source on Main Unit)
+    result.timestamp = rtc_getUnixTimestamp();
+
+    bleHavDataOK = true;
+
+    if (xQueueSend(xQueueHAVData, &result, 0) != pdTRUE) {
+        LOG_W("BLE_RX", "xQueueHAVData full — BLE HAV epoch dropped (seq=%lu)", seq);
+    } else {
+        LOG_I("BLE_RX", "seq=%lu ahv=%.4f m/s2 | ahwx=%.4f ahwy=%.4f ahwz=%.4f | n=%lu",
+              seq, ahv, ahwx, ahwy, ahwz, nSamples);
+    }
+}
+
+/** @brief Called by BLE stack when a notification arrives from HAV Node. */
+static void onHavNotify(BLERemoteCharacteristic *pChar,
+                        uint8_t *pData, size_t length, bool isNotify) {
+    // Ensure null-termination before parsing
+    char buf[160];
+    size_t copyLen = (length < sizeof(buf) - 1) ? length : sizeof(buf) - 2;
+    memcpy(buf, pData, copyLen);
+    buf[copyLen] = '\0';
+
+    parseAndEnqueueHavPayload(buf);
+}
+
+/** @brief Scan result callback — stores the first matching HAV Node device. */
+class HavAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
+    void onResult(BLEAdvertisedDevice advertisedDevice) override {
+        if (advertisedDevice.getName() == BLE_HAV_DEVICE_NAME ||
+            advertisedDevice.haveServiceUUID() &&
+            advertisedDevice.isAdvertisingService(BLEUUID(BLE_SERVICE_UUID)))
+        {
+            BLEDevice::getScan()->stop();
+            pFoundDevice = new BLEAdvertisedDevice(advertisedDevice);
+            doConnect    = true;
+            doScan       = false;
+            LOG_I("BLE", "HAV Node found: %s", advertisedDevice.getAddress().toString().c_str());
+        }
+    }
+};
+
+// =============================================================================
+// TASK: vTaskBLEReceiver
+// Core 1 | Priority 3 | Event-driven (blocks on BLE callbacks)
 // =============================================================================
 /**
- * @brief  HAV acquisition task — Core 0, Priority 5.
+ * @brief  BLE Receiver task — Core 1, Priority 3.
  *
- *         Reads tri-axial acceleration from the HAV ADXL345 at 2000 Hz,
- *         applies ISO 8041 Wh frequency-weighting (3-section biquad cascade),
- *         accumulates squared weighted samples for RMS, and pushes a
- *         one-second epoch result onto xQueueHAVData.
+ *         Manages the full BLE Client lifecycle:
+ *           1. Scan for "HAV_NODE" advertising the HAV Service UUID.
+ *           2. Connect and subscribe to HAV Characteristic (NOTIFY).
+ *           3. Receive HAV RMS epoch notifications from HAV Node firmware.
+ *           4. Parse CSV payload and enqueue HavRmsData_t to xQueueHAVData.
+ *           5. Detect disconnection and automatically reconnect.
  *
- *         Timing: vTaskDelayUntil ensures a strict 1 ms period (FreeRTOS tick).
- *         Sub-millisecond accuracy relies on the ADXL345 ODR being ≥ 2000 Hz
- *         (set to 3200 Hz) and the I2C bus being fast enough.
+ *         The task does NOT gate on SYS_LOGGING — it keeps BLE alive at all
+ *         times so that HAV data is ready the moment logging starts.
  */
-static void vTaskHAVAcquisition(void *pvParameters) {
-    static const char *TAG = "HAV_ACQ";
+static void vTaskBLEReceiver(void *pvParameters) {
+    static const char *TAG = "BLE_RX";
 
-    // Per-axis Wh IIR filters (task-local, no shared state)
-    static BiquadCascade filterHAV_X(coeff_wh, NUM_SECTIONS_WH);
-    static BiquadCascade filterHAV_Y(coeff_wh, NUM_SECTIONS_WH);
-    static BiquadCascade filterHAV_Z(coeff_wh, NUM_SECTIONS_WH);
+    LOG_I(TAG, "BLE Receiver task started on Core %d", xPortGetCoreID());
 
-    // RMS accumulators
-    float sumX2 = 0.0f, sumY2 = 0.0f, sumZ2 = 0.0f;
-    uint32_t sampleCount = 0;
-
-    // Timing baseline for vTaskDelayUntil
-    TickType_t xLastWakeTime = xTaskGetTickCount();
-    const TickType_t xPeriod = pdMS_TO_TICKS(HAV_PERIOD_MS); // 1 ms tick
-
-    LOG_I(TAG, "HAV acquisition task started on Core %d", xPortGetCoreID());
+    BLEDevice::init("");   // Initialise BLE stack (client mode, no name needed)
+    doScan = true;
 
     while (true) {
-        // ── Precise periodic delay — no drift ────────────────────────────────
-        vTaskDelayUntil(&xLastWakeTime, xPeriod);
+        // ── 1. Initiate Scan ─────────────────────────────────────────────────
+        if (doScan) {
+            doScan = false;
+            bleConnected = false;
 
-        // ── Gate on system state ─────────────────────────────────────────────
-        const SystemState_t state = getSystemState();
-        if (state != SYS_LOGGING) {
-            // Reset filters and accumulators when not actively logging
-            if (state == SYS_READY || state == SYS_ERROR) {
-                filterHAV_X.reset();
-                filterHAV_Y.reset();
-                filterHAV_Z.reset();
-                sumX2 = sumY2 = sumZ2 = 0.0f;
-                sampleCount = 0;
+            LOG_I(TAG, "Scanning for %s ...", BLE_HAV_DEVICE_NAME);
+            BLEScan *pScan = BLEDevice::getScan();
+            pScan->setAdvertisedDeviceCallbacks(new HavAdvertisedDeviceCallbacks());
+            pScan->setActiveScan(true);
+            pScan->setInterval(100);
+            pScan->setWindow(99);
+            pScan->start(BLE_SCAN_DURATION_S, false);
+
+            if (!doConnect) {
+                // Not found in this scan window — wait, then retry
+                LOG_W(TAG, "HAV Node not found. Retrying in %d ms...", BLE_RECONNECT_MS);
+                vTaskDelay(pdMS_TO_TICKS(BLE_RECONNECT_MS));
+                doScan = true;
             }
-            continue;
         }
 
-        if (!havSensorOK) continue;
+        // ── 2. Connect & Subscribe ───────────────────────────────────────────
+        if (doConnect && pFoundDevice != nullptr) {
+            doConnect = false;
 
-        // ── Sensor Read or Simulation ─────────────────────────────────────────
-        float ax = 0.0f, ay = 0.0f, az = 0.0f;
-#if SIMULATE_HAV_DATA
-        // Generate mock hand-arm vibration data (combination of sines representing motor/handlebar frequencies)
-        static float simTime = 0.0f;
-        simTime += 0.0005f; // dt for 2000 Hz
-        ax = 2.5f * sinf(2.0f * PI * 15.0f * simTime) + 1.0f * sinf(2.0f * PI * 80.0f * simTime);
-        ay = 1.8f * cosf(2.0f * PI * 18.0f * simTime) + 0.5f * sinf(2.0f * PI * 120.0f * simTime);
-        az = 3.0f * sinf(2.0f * PI * 25.0f * simTime) + 0.2f * cosf(2.0f * PI * 150.0f * simTime);
-#else
-        if (!adxl345_read(ADXL345_ADDR_HAV, ax, ay, az)) {
-            continue;
-        }
-#endif
+            if (pBleClient != nullptr) {
+                if (pBleClient->isConnected()) pBleClient->disconnect();
+                delete pBleClient;
+            }
+            pBleClient = BLEDevice::createClient();
 
-        // ── Wh Frequency Weighting (ISO 8041 Biquad Cascade) ─────────────────
-        const float axWh = filterHAV_X.process(ax);
-        const float ayWh = filterHAV_Y.process(ay);
-        const float azWh = filterHAV_Z.process(az);
+            LOG_I(TAG, "Connecting to HAV Node...");
 
-        // ── RMS Accumulation ──────────────────────────────────────────────────
-        sumX2 += axWh * axWh;
-        sumY2 += ayWh * ayWh;
-        sumZ2 += azWh * azWh;
-        sampleCount++;
-
-        // ── 1-Second Epoch Boundary ───────────────────────────────────────────
-        if (sampleCount >= HAV_EPOCH_SAMPLES) {
-            HavRmsData_t result;
-            result.n_samples = sampleCount;
-            result.ahwx      = sqrtf(sumX2 / sampleCount);
-            result.ahwy      = sqrtf(sumY2 / sampleCount);
-            result.ahwz      = sqrtf(sumZ2 / sampleCount);
-            // ISO 5349-1 vector sum: ahv = √(ahwx² + ahwy² + ahwz²)
-            result.ahv       = sqrtf(result.ahwx * result.ahwx
-                                   + result.ahwy * result.ahwy
-                                   + result.ahwz * result.ahwz);
-            result.timestamp = rtc_getUnixTimestamp();
-
-            // Push to queue — non-blocking; drop if Logger is behind
-            if (xQueueSend(xQueueHAVData, &result, 0) != pdTRUE) {
-                LOG_W(TAG, "xQueueHAVData full — epoch dropped (t=%lu)", result.timestamp);
+            if (!pBleClient->connect(pFoundDevice)) {
+                LOG_E(TAG, "BLE connect failed. Will retry scan.");
+                delete pFoundDevice;
+                pFoundDevice = nullptr;
+                doScan = true;
+                vTaskDelay(pdMS_TO_TICKS(BLE_RECONNECT_MS));
+                continue;
             }
 
-            LOG_I(TAG, "ahv=%.4f m/s2 | ahwx=%.4f ahwy=%.4f ahwz=%.4f | n=%lu",
-                  result.ahv, result.ahwx, result.ahwy, result.ahwz, result.n_samples);
+            LOG_I(TAG, "Connected to HAV Node.");
 
-            // Reset accumulators
-            sumX2 = sumY2 = sumZ2 = 0.0f;
-            sampleCount = 0;
+            // Get the remote service
+            BLERemoteService *pRemoteService =
+                pBleClient->getService(BLEUUID(BLE_SERVICE_UUID));
+
+            if (pRemoteService == nullptr) {
+                LOG_E(TAG, "HAV Service UUID not found on device.");
+                pBleClient->disconnect();
+                doScan = true;
+                continue;
+            }
+
+            // Get the HAV characteristic
+            pHavCharacteristic =
+                pRemoteService->getCharacteristic(BLEUUID(BLE_CHAR_UUID_HAV));
+
+            if (pHavCharacteristic == nullptr) {
+                LOG_E(TAG, "HAV Characteristic UUID not found.");
+                pBleClient->disconnect();
+                doScan = true;
+                continue;
+            }
+
+            // Register notification callback
+            if (pHavCharacteristic->canNotify()) {
+                pHavCharacteristic->registerForNotify(onHavNotify);
+                LOG_I(TAG, "Subscribed to HAV notifications.");
+            } else {
+                LOG_W(TAG, "Characteristic does not support NOTIFY.");
+            }
+
+            bleConnected = true;
+
+            delete pFoundDevice;
+            pFoundDevice = nullptr;
         }
+
+        // ── 3. Monitor Connection ────────────────────────────────────────────
+        if (bleConnected) {
+            if (pBleClient == nullptr || !pBleClient->isConnected()) {
+                // Connection dropped
+                bleConnected  = false;
+                bleHavDataOK  = false;
+                LOG_W(TAG, "BLE disconnected from HAV Node. Rescanning...");
+                doScan = true;
+            }
+        }
+
+        // Yield — BLE notifications arrive asynchronously via callback
+        vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
 
@@ -811,16 +927,17 @@ static void vTaskHMIAndController(void *pvParameters) {
 
             // ── SELF_TEST: Verify all peripherals ───────────────────────────
             case SYS_SELF_TEST: {
-                // [PLACEHOLDER — Self-Test Routine]
-                // Re-verify sensor presence and SD card mount
-                const bool allOK = (havSensorOK && wbvSensorOK);
+                // WBV sensor and SD card are the minimum requirements for READY.
+                // BLE (HAV) connection is optional — logging continues without HAV.
+                const bool allOK = (wbvSensorOK && sdOK);
                 if (allOK) {
                     setSystemState(SYS_READY);
-                    LOG_I(TAG, "FSM: SELF_TEST → READY");
+                    LOG_I(TAG, "FSM: SELF_TEST → READY (WBV=%d SD=%d BLE=%d)",
+                          wbvSensorOK, sdOK, (int)bleConnected);
                 } else {
                     setSystemState(SYS_ERROR);
-                    LOG_E(TAG, "FSM: SELF_TEST → ERROR (HAV:%d WBV:%d SD:%d)",
-                          havSensorOK, wbvSensorOK, sdOK);
+                    LOG_E(TAG, "FSM: SELF_TEST → ERROR (WBV:%d SD:%d)",
+                          wbvSensorOK, sdOK);
                 }
                 break;
             }
@@ -893,8 +1010,8 @@ static void vTaskHMIAndController(void *pvParameters) {
                         case SYS_ERROR:     oled.println("ERROR");     break;
                     }
 
-                    oled.print("HAV Acc: ");
-                    oled.println(havSensorOK ? "OK" : "ERR");
+                    oled.print("HAV BLE: ");
+                    oled.println(bleConnected ? (bleHavDataOK ? "DATA" : "CONN") : "DISC");
                     oled.print("WBV Acc: ");
                     oled.println(wbvSensorOK ? "OK" : "ERR");
                     oled.print("SD Card: ");
@@ -924,19 +1041,8 @@ static void runSelfTest() {
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(100000); // Start at 100 kHz for detection
 
-    // HAV ADXL345
-#if SIMULATE_HAV_DATA
-    havSensorOK = true;
-    LOG_I("INIT", "HAV ADXL345 is simulated (SIMULATE_HAV_DATA=1)");
-#else
-    havSensorOK = adxl345_detect(ADXL345_ADDR_HAV);
-    if (havSensorOK) {
-        havSensorOK = adxl345_init(ADXL345_ADDR_HAV, ADXL_BW_3200HZ);
-        LOG_I("INIT", "HAV ADXL345 @ 0x%02X init %s", ADXL345_ADDR_HAV, havSensorOK ? "OK" : "FAIL");
-    } else {
-        LOG_E("INIT", "HAV ADXL345 @ 0x%02X NOT FOUND", ADXL345_ADDR_HAV);
-    }
-#endif
+#if USE_BLE_HAV
+    LOG_I("INIT", "HAV source: BLE (HAV_NODE) — local HAV sensor not probed");
 
     // WBV ADXL345 Auto-Detect (0x53 or 0x1D)
     if (adxl345_detect(0x53)) {
@@ -1020,14 +1126,7 @@ static void createRTOSObjects() {
 static void createTasks() {
     BaseType_t res;
 
-    // ── Core 0: High-priority DSP tasks ──────────────────────────────────────
-    res = xTaskCreatePinnedToCore(
-        vTaskHAVAcquisition, "HAV_ACQ",
-        TASK_STACK_HAV, nullptr,
-        TASK_PRIO_HAV, &hTaskHAV,
-        CORE_DSP);
-    configASSERT(res == pdPASS);
-
+    // ── Core 0: WBV Acquisition ─────────
     res = xTaskCreatePinnedToCore(
         vTaskWBVAcquisition, "WBV_ACQ",
         TASK_STACK_WBV, nullptr,
@@ -1035,7 +1134,16 @@ static void createTasks() {
         CORE_DSP);
     configASSERT(res == pdPASS);
 
-    // ── Core 1: Peripheral tasks ──────────────────────────────────────────────
+    // ── Core 1: BLE Receiver, Logger, HMI ────────────────────────────────────
+#if USE_BLE_HAV
+    res = xTaskCreatePinnedToCore(
+        vTaskBLEReceiver, "BLE_RX",
+        TASK_STACK_BLE, nullptr,
+        TASK_PRIO_BLE, &hTaskBLE,
+        CORE_PERIPHERAL);
+    configASSERT(res == pdPASS);
+#endif
+
     res = xTaskCreatePinnedToCore(
         vTaskDataLogger, "LOGGER",
         TASK_STACK_LOGGER, nullptr,
@@ -1065,8 +1173,9 @@ void setup() {
 
     Serial.println();
     Serial.println("==========================================================");
-    Serial.println("  Vibration Dosimeter ESP32 — HAV/WBV Firmware v1.1       ");
+    Serial.println("  Vibration Dosimeter — Main Unit Firmware v2.0            ");
     Serial.println("  Standards: ISO 5349-1 (HAV) | ISO 2631-1 (WBV)          ");
+    Serial.println("  HAV: BLE from HAV Node | WBV: Local ADXL345              ");
     Serial.println("  Framework: Arduino + FreeRTOS Dual-Core                  ");
     Serial.println("==========================================================");
 
@@ -1084,13 +1193,15 @@ void setup() {
     // Run synchronous sensor self-test before starting tasks
     runSelfTest();
 
-    // Set initial FSM state based on self-test results
-    if (havSensorOK && wbvSensorOK) {
+    // Set initial FSM state based on self-test results.
+    // BLE connection is NOT required to transition to READY.
+    // (BLE Receiver task connects asynchronously after scheduler starts.)
+    if (wbvSensorOK && sdOK) {
         setSystemState(SYS_READY);
-        LOG_I("INIT", "FSM: INIT → READY");
+        LOG_I("INIT", "FSM: INIT → READY (WBV OK, SD OK, BLE connecting in background)");
     } else {
         setSystemState(SYS_ERROR);
-        LOG_E("INIT", "FSM: INIT → ERROR — check sensor wiring");
+        LOG_E("INIT", "FSM: INIT → ERROR — WBV=%d SD=%d", wbvSensorOK, sdOK);
     }
 
     // Create and pin all FreeRTOS tasks

@@ -1,0 +1,576 @@
+/**
+ * @file    main.cpp
+ * @brief   Vibration Dosimeter ESP32 — HAV Node Firmware (Single-Core Polling)
+ *
+ * @details Hand-Arm Vibration (HAV) edge processing node conforming to ISO 5349-1.
+ *
+ *          ┌──────────────────────────────────────────────────────────────────┐
+ *          │  Main Loop (Core 1)                                              │
+ *          │   • High-frequency ADXL345 acquisition (3200 Hz via micro timer) │
+ *          │   • ISO 5349-1 frequency weighting filter (Wh on X, Y, Z axes)   │
+ *          │   • Accumulates 1-second RMS epoch (3200 samples)                 │
+ *          │   • Transmits RMS results over BLE as GATT Server (Peripheral)    │
+ *          └──────────────────────────────────────────────────────────────────┘
+ *
+ *          This unit operates as a BLE Server. The Main Unit subscribes to the HAV
+ *          Characteristic (NOTIFY) to receive one-second epoch data.
+ *          Payload format: "HAV,seq,millis_ms,ahwx,ahwy,ahwz,ahv,n_samples"
+ *
+ * @note    Target Hardware : ESP32 Dual-Core (240 MHz)
+ *          Framework       : Arduino Core
+ *          HAV Sensor      : ADXL345 (I2C, auto-detect 0x53 or 0x1D), 3200 Hz ODR
+ *          BLE Role        : BLE Server ("HAV_NODE" device name)
+ *
+ * @author  Team EL4060
+ * @date    2026-06-17
+ */
+
+// =============================================================================
+// INCLUDES
+// =============================================================================
+#include <Arduino.h>
+#include <Wire.h>
+
+// BLE Server (ESP32 built-in Bluetooth stack)
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+
+// Project filter coefficient headers (MATLAB-generated, ISO 8041)
+#include "hav_coefficients.h"
+
+// =============================================================================
+// DEBUG CONFIGURATION
+// =============================================================================
+#define DEBUG_ENABLED      1
+
+#if DEBUG_ENABLED
+  #define LOG_I(tag, fmt, ...)  Serial.printf("[INFO][%s] " fmt "\n", tag, ##__VA_ARGS__)
+  #define LOG_W(tag, fmt, ...)  Serial.printf("[WARN][%s] " fmt "\n", tag, ##__VA_ARGS__)
+  #define LOG_E(tag, fmt, ...)  Serial.printf("[ERR ][%s] " fmt "\n", tag, ##__VA_ARGS__)
+#else
+  #define LOG_I(tag, fmt, ...)  do {} while(0)
+  #define LOG_W(tag, fmt, ...)  do {} while(0)
+  #define LOG_E(tag, fmt, ...)  do {} while(0)
+#endif
+
+// =============================================================================
+// HARDWARE PIN DEFINITIONS
+// =============================================================================
+// --- I2C Bus (shared: HAV sensor) ---
+#define PIN_I2C_SDA          21
+#define PIN_I2C_SCL          22
+
+// =============================================================================
+// ADXL345 REGISTER MAP & CONFIG
+// =============================================================================
+#define ADXL345_ADDR_1       0x53   // Primary I2C address (SDO tied to GND)
+#define ADXL345_ADDR_2       0x1D   // Secondary I2C address (SDO tied to VCC)
+
+#define REG_DEVID            0x00   // Device ID Register
+#define REG_BW_RATE          0x2C   // Data rate and power control
+#define REG_POWER_CTL        0x2D   // Power-saving features control
+#define REG_DATA_FORMAT      0x31   // Data format control
+#define REG_DATAX0           0x32   // X-Axis Data 0 (start register for tri-axial read)
+
+#define ADXL345_DEVID_VALUE  0xE5   // Expected Device ID for ADXL345
+
+// ADXL345 settings
+#define ADXL_BW_3200HZ       0x0F   // 3200 Hz ODR — HAV
+#define ADXL_FORMAT_FULLRES_16G 0x0B // FULL_RES | Range ±16g
+
+#define ADXL_SCALE_G_PER_LSB 0.0039f  // Scale factor in full-resolution mode (g/LSB)
+#define G_TO_MPS2            9.80665f // Gravitational constant (m/s²)
+
+// =============================================================================
+// BLE SERVER CONFIGURATION
+// =============================================================================
+#define BLE_DEVICE_NAME      "HAV_NODE"
+#define BLE_SERVICE_UUID     "9b6f0001-5f5a-4f0d-9d7f-000000000001"
+#define BLE_CHAR_UUID_HAV    "9b6f0002-5f5a-4f0d-9d7f-000000000002"
+
+// =============================================================================
+// SAMPLING & TIMING CONSTANTS
+// =============================================================================
+const float FS = FS_HAV;                     ///< 3200 Hz sampling rate (from hav_coefficients.h)
+
+// 1 / 3200 Hz = 312.5 us period.
+// Multiplied by 100 to represent 312.5 us precisely as an integer (31250) for micros() usage.
+const uint32_t SAMPLE_PERIOD_US_X100 = 31250;
+const uint16_t HAV_EPOCH_SAMPLES = 3200;     ///< Epoch window of 1 second (3200 samples)
+
+// =============================================================================
+// GLOBAL STATE
+// =============================================================================
+uint8_t adxlAddress = 0x00;              ///< Detected ADXL345 I2C address
+bool adxlAvailable = false;             ///< True if ADXL345 is successfully initialized
+
+BLECharacteristic *havCharacteristic = nullptr; ///< Characteristic for sending HAV data
+bool bleClientConnected = false;        ///< Connection state with BLE Client
+
+uint32_t packetCounter = 0;             ///< Sequential packet counter for transmitted epochs
+
+// =============================================================================
+// BIQUAD CASCADE FILTER CLASS
+// =============================================================================
+/**
+ * @class BiquadCascade
+ * @brief Thread-local Direct Form II Transposed IIR biquad cascade filter.
+ *        Each filter instance contains its own coefficients and delay line states.
+ *
+ * Difference equation per section (a0 = 1 normalised):
+ *   y[n] = b0·x[n] + b1·x[n-1] + b2·x[n-2] − a1·y[n-1] − a2·y[n-2]
+ *
+ * Coefficient layout: coeff[section][5] = {b0, b1, b2, a1, a2}
+ */
+class BiquadCascade {
+public:
+    static constexpr int MAX_SECTIONS = 4; ///< Maximum supported biquad sections
+
+    /**
+     * @brief Construct a new Biquad Cascade filter instance.
+     * @param coeff        Pointer to the 2D array of coefficients.
+     * @param numSections  Number of active biquad sections in the cascade.
+     */
+    BiquadCascade(const float (*coeff)[5], int numSections)
+        : coeff_(coeff), numSections_(numSections) {
+        reset();
+    }
+
+    /**
+     * @brief  Process a single input sample through all biquad sections.
+     * @param  input  Raw accelerometer sample [m/s²]
+     * @return Frequency-weighted output sample [m/s²]
+     */
+    inline float process(float input) {
+        float x = input;
+        for (int i = 0; i < numSections_; ++i) {
+            const float b0 = coeff_[i][0];
+            const float b1 = coeff_[i][1];
+            const float b2 = coeff_[i][2];
+            const float a1 = coeff_[i][3];
+            const float a2 = coeff_[i][4];
+
+            const float y = b0 * x   + b1 * x1_[i] + b2 * x2_[i]
+                              - a1 * y1_[i] - a2 * y2_[i];
+
+            x2_[i] = x1_[i];   x1_[i] = x;
+            y2_[i] = y1_[i];   y1_[i] = y;
+            x = y;
+        }
+        return x;
+    }
+
+    /** @brief Reset all internal delay-line states to zero. */
+    void reset() {
+        for (int i = 0; i < MAX_SECTIONS; ++i) {
+            x1_[i] = x2_[i] = y1_[i] = y2_[i] = 0.0f;
+        }
+    }
+
+private:
+    const float (*coeff_)[5];
+    int          numSections_;
+    float        x1_[MAX_SECTIONS];
+    float        x2_[MAX_SECTIONS];
+    float        y1_[MAX_SECTIONS];
+    float        y2_[MAX_SECTIONS];
+};
+
+// --- ISO 5349-1 Wh Weighting Filters (one for each axis) ---
+BiquadCascade filterX(coeff_wh, NUM_SECTIONS_WH);
+BiquadCascade filterY(coeff_wh, NUM_SECTIONS_WH);
+BiquadCascade filterZ(coeff_wh, NUM_SECTIONS_WH);
+
+// =============================================================================
+// I2C HELPER FUNCTIONS (Wire-based, blocking)
+// =============================================================================
+/**
+ * @brief Write a single byte value to an I2C device register.
+ * @param addr   I2C slave address.
+ * @param reg    Register address to write to.
+ * @param value  Byte value to write.
+ * @return true on success, false on failure.
+ */
+bool writeRegister(uint8_t addr, uint8_t reg, uint8_t value) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    Wire.write(value);
+    return (Wire.endTransmission() == 0);
+}
+
+/**
+ * @brief Read a single byte value from an I2C device register.
+ * @param addr        I2C slave address.
+ * @param reg         Register address to read from.
+ * @param[out] value  Reference to store the read byte.
+ * @return true on success, false on failure.
+ */
+bool readRegister(uint8_t addr, uint8_t reg, uint8_t &value) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    if (Wire.requestFrom((int)addr, 1) != 1 || Wire.available() < 1) {
+        return false;
+    }
+
+    value = Wire.read();
+    return true;
+}
+
+/**
+ * @brief Perform a burst read of multiple consecutive registers over I2C.
+ * @param addr         I2C slave address.
+ * @param startReg     Starting register address.
+ * @param[out] buffer  Buffer to store the read data.
+ * @param length       Number of bytes to read.
+ * @return true on success, false on failure.
+ */
+bool readMultipleRegisters(uint8_t addr, uint8_t startReg, uint8_t *buffer, uint8_t length) {
+    Wire.beginTransmission(addr);
+    Wire.write(startReg);
+    if (Wire.endTransmission(false) != 0) {
+        return false;
+    }
+
+    if ((uint8_t)Wire.requestFrom((int)addr, (int)length) != length) {
+        while (Wire.available()) {
+            Wire.read(); // Flush any garbage
+        }
+        return false;
+    }
+
+    for (uint8_t i = 0; i < length; i++) {
+        if (!Wire.available()) {
+            return false;
+        }
+        buffer[i] = Wire.read();
+    }
+    return true;
+}
+
+// =============================================================================
+// ADXL345 DRIVER FUNCTIONS
+// =============================================================================
+/**
+ * @brief Scan for ADXL345 sensor address (0x53 or 0x1D) and verify Device ID.
+ * @return true if detected, false otherwise.
+ */
+bool detectADXL345() {
+    uint8_t devid = 0;
+
+    // Check primary address 0x53
+    if (readRegister(ADXL345_ADDR_1, REG_DEVID, devid)) {
+        if (devid == ADXL345_DEVID_VALUE) {
+            adxlAddress = ADXL345_ADDR_1;
+            return true;
+        }
+    }
+
+    // Check secondary address 0x1D
+    if (readRegister(ADXL345_ADDR_2, REG_DEVID, devid)) {
+        if (devid == ADXL345_DEVID_VALUE) {
+            adxlAddress = ADXL345_ADDR_2;
+            return true;
+        }
+    }
+
+    adxlAddress = 0x00;
+    return false;
+}
+
+/**
+ * @brief Initialize and configure the ADXL345 sensor for 3200 Hz ODR / ±16g.
+ * @return true on successful configuration.
+ */
+bool setupADXL345() {
+    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+    Wire.setClock(100000); // Start with 100 kHz I2C clock for initialization
+
+    if (!detectADXL345()) {
+        return false;
+    }
+
+    LOG_I("INIT", "ADXL345 HAV detected at I2C address 0x%02X", adxlAddress);
+
+    // 1. Enter Standby mode to configure
+    if (!writeRegister(adxlAddress, REG_POWER_CTL, 0x00)) {
+        return false;
+    }
+
+    // 2. Set output data rate to 3200 Hz ODR
+    if (!writeRegister(adxlAddress, REG_BW_RATE, ADXL_BW_3200HZ)) {
+        return false;
+    }
+
+    // 3. Set data format: Full resolution mode, Range ±16g
+    if (!writeRegister(adxlAddress, REG_DATA_FORMAT, ADXL_FORMAT_FULLRES_16G)) {
+        return false;
+    }
+
+    // 4. Enter Measurement mode
+    if (!writeRegister(adxlAddress, REG_POWER_CTL, 0x08)) {
+        return false;
+    }
+
+    Wire.setClock(400000); // Raise I2C clock to 400 kHz for high-frequency polling
+
+    LOG_I("INIT", "ADXL345 HAV configuration complete:");
+    LOG_I("INIT", "  - Range    : +/-16g full resolution");
+    LOG_I("INIT", "  - DataRate : 3200 Hz");
+
+    return true;
+}
+
+/**
+ * @brief Read tri-axial acceleration from the configured ADXL345 sensor.
+ * @param[out] ax  Acceleration on X-axis [m/s²]
+ * @param[out] ay  Acceleration on Y-axis [m/s²]
+ * @param[out] az  Acceleration on Z-axis [m/s²]
+ * @return true on success.
+ */
+bool readADXL345(float &ax, float &ay, float &az) {
+    if (!adxlAvailable) {
+        return false;
+    }
+
+    uint8_t data[6];
+    if (!readMultipleRegisters(adxlAddress, REG_DATAX0, data, 6)) {
+        return false;
+    }
+
+    const int16_t rawX = (int16_t)((data[1] << 8) | data[0]);
+    const int16_t rawY = (int16_t)((data[3] << 8) | data[2]);
+    const int16_t rawZ = (int16_t)((data[5] << 8) | data[4]);
+
+    ax = rawX * ADXL_SCALE_G_PER_LSB * G_TO_MPS2;
+    ay = rawY * ADXL_SCALE_G_PER_LSB * G_TO_MPS2;
+    az = rawZ * ADXL_SCALE_G_PER_LSB * G_TO_MPS2;
+
+    return true;
+}
+
+// =============================================================================
+// BLE SERVER CALLBACKS
+// =============================================================================
+/**
+ * @class HavBleServerCallbacks
+ * @brief BLE Server Callbacks to monitor client connections and handle advertising.
+ */
+class HavBleServerCallbacks : public BLEServerCallbacks {
+    /** @brief Triggered when a BLE Client connects. */
+    void onConnect(BLEServer *server) override {
+        bleClientConnected = true;
+        LOG_I("BLE", "BLE client connected.");
+    }
+
+    /** @brief Triggered when a BLE Client disconnects; restarts advertising. */
+    void onDisconnect(BLEServer *server) override {
+        bleClientConnected = false;
+        LOG_W("BLE", "BLE client disconnected. Restarting advertising...");
+        server->getAdvertising()->start();
+    }
+};
+
+// =============================================================================
+// BLE SETUP
+// =============================================================================
+/**
+ * @brief Initialize the BLE Stack, GATT Server, Service, and Characteristic.
+ */
+void setupBLE() {
+    BLEDevice::init(BLE_DEVICE_NAME);
+
+    BLEServer *server = BLEDevice::createServer();
+    server->setCallbacks(new HavBleServerCallbacks());
+
+    BLEService *service = server->createService(BLE_SERVICE_UUID);
+
+    havCharacteristic = service->createCharacteristic(
+        BLE_CHAR_UUID_HAV,
+        BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_NOTIFY
+    );
+
+    // Client Characteristic Configuration Descriptor (needed for Notifications)
+    havCharacteristic->addDescriptor(new BLE2902());
+
+    // Set fallback initial value
+    havCharacteristic->setValue("HAV,0,0,0,0,0,0,0");
+
+    service->start();
+
+    // Start BLE Advertising
+    BLEAdvertising *advertising = BLEDevice::getAdvertising();
+    advertising->addServiceUUID(BLE_SERVICE_UUID);
+    advertising->setScanResponse(true);
+    advertising->setMinPreferred(0x06);
+    advertising->setMinPreferred(0x12);
+    advertising->start();
+
+    LOG_I("BLE", "BLE HAV Node advertising started.");
+}
+
+// =============================================================================
+// SEND HAV BLE PACKET
+// =============================================================================
+/**
+ * @brief Pack aggregate data and notify the subscribed BLE client.
+ *
+ *        Payload Format (CSV):
+ *        "HAV,<seq>,<millis_ms>,<ahwx>,<ahwy>,<ahwz>,<ahv>,<n_samples>"
+ *
+ * @param ahwx      Wh-weighted RMS acceleration on X-axis [m/s²]
+ * @param ahwy      Wh-weighted RMS acceleration on Y-axis [m/s²]
+ * @param ahwz      Wh-weighted RMS acceleration on Z-axis [m/s²]
+ * @param ahv       Vector-sum RMS acceleration [m/s²]
+ * @param nSamples  Number of samples in this epoch
+ */
+void sendHavBlePacket(float ahwx, float ahwy, float ahwz, float ahv, uint16_t nSamples) {
+    char payload[128];
+    const uint32_t nowMs = millis();
+
+    snprintf(payload, sizeof(payload),
+             "HAV,%lu,%lu,%.6f,%.6f,%.6f,%.6f,%u",
+             packetCounter,
+             nowMs,
+             ahwx,
+             ahwy,
+             ahwz,
+             ahv,
+             nSamples);
+
+    // Print raw payload to serial console regardless of connection state
+    Serial.println(payload);
+
+    if (havCharacteristic != nullptr) {
+        havCharacteristic->setValue(payload);
+        if (bleClientConnected) {
+            havCharacteristic->notify();
+        }
+    }
+
+    packetCounter++;
+}
+
+// =============================================================================
+// ARDUINO SETUP — Runs once on Core 1 before the loop
+// =============================================================================
+void setup() {
+#if DEBUG_ENABLED
+    Serial.begin(115200);
+    delay(500); // Short settling delay
+#endif
+
+    Serial.println();
+    Serial.println("==========================================================");
+    Serial.println("  Vibration Dosimeter — HAV Node Firmware v2.0             ");
+    Serial.println("  Standards: ISO 5349-1 (HAV)                             ");
+    Serial.println("  Peripherals: ADXL345 + Wh Filter + BLE Server            ");
+    Serial.println("  Design Configuration: No RTC, no SD, no OLED             ");
+    Serial.println("==========================================================");
+
+    adxlAvailable = setupADXL345();
+
+    if (!adxlAvailable) {
+        LOG_E("INIT", "ADXL345 HAV sensor initialization FAILED.");
+        LOG_W("INIT", "Check wiring connections:");
+        LOG_W("INIT", "  - VCC -> 3V3");
+        LOG_W("INIT", "  - GND -> GND");
+        LOG_W("INIT", "  - SDA -> GPIO21");
+        LOG_W("INIT", "  - SCL -> GPIO22");
+        LOG_W("INIT", "  - CS  -> 3V3");
+        LOG_W("INIT", "  - SDO -> GND (for 0x53) or 3V3 (for 0x1D)");
+    }
+
+    setupBLE();
+
+    LOG_I("INIT", "Sampling rate HAV set to %.1f Hz", FS);
+    LOG_I("INIT", "Expected BLE CSV Packet Format:");
+    LOG_I("INIT", "  HAV,seq,millis_ms,ahwx,ahwy,ahwz,ahv,n_samples");
+}
+
+// =============================================================================
+// ARDUINO LOOP
+// =============================================================================
+/**
+ * @brief High-frequency main acquisition and filtering loop.
+ *        Executes at exactly 3200 Hz using micros() timing control.
+ */
+void loop() {
+    static uint64_t nextSampleTimeUsX100 = (uint64_t)micros() * 100ULL + SAMPLE_PERIOD_US_X100;
+
+    static float sumX2 = 0.0f;
+    static float sumY2 = 0.0f;
+    static float sumZ2 = 0.0f;
+    static uint16_t sampleCount = 0;
+
+    static float lastRawX = 0.0f;
+    static float lastRawY = 0.0f;
+    static float lastRawZ = 0.0f;
+
+    static uint32_t lastErrorPrintMs = 0;
+
+    const uint64_t nowUsX100 = (uint64_t)micros() * 100ULL;
+
+    if (nowUsX100 >= nextSampleTimeUsX100) {
+        nextSampleTimeUsX100 += SAMPLE_PERIOD_US_X100;
+
+        float ax = 0.0f, ay = 0.0f, az = 0.0f;
+
+        // ── Sensor Read ──────────────────────────────────────────────────────
+        if (!readADXL345(ax, ay, az)) {
+            const uint32_t nowMs = millis();
+            if (nowMs - lastErrorPrintMs >= 1000) {
+                lastErrorPrintMs = nowMs;
+                LOG_E("SENSOR", "ADXL345 HAV read failed! Retrying initialization...");
+
+                // Attempt hardware sensor recovery
+                Wire.setClock(100000);
+                adxlAvailable = setupADXL345();
+                Wire.setClock(400000);
+            }
+            return;
+        }
+
+        lastRawX = ax;
+        lastRawY = ay;
+        lastRawZ = az;
+
+        // ── Frequency Weighting: ISO 5349-1 Wh Weighting ─────────────────────
+        const float axWh = filterX.process(ax);
+        const float ayWh = filterY.process(ay);
+        const float azWh = filterZ.process(az);
+
+        // ── RMS Accumulation ─────────────────────────────────────────────────
+        sumX2 += axWh * axWh;
+        sumY2 += ayWh * ayWh;
+        sumZ2 += azWh * azWh;
+        sampleCount++;
+
+        // ── 1-Second Epoch Boundary ──────────────────────────────────────────
+        if (sampleCount >= HAV_EPOCH_SAMPLES) {
+            const float ahwx = sqrtf(sumX2 / sampleCount);
+            const float ahwy = sqrtf(sumY2 / sampleCount);
+            const float ahwz = sqrtf(sumZ2 / sampleCount);
+
+            // ISO 5349-1 vector-sum: ahv = √(ahwx² + ahwy² + ahwz²)
+            const float ahv = sqrtf(ahwx * ahwx + ahwy * ahwy + ahwz * ahwz);
+
+            // Log raw axes data alongside the BLE transmission info
+            Serial.printf("RAW: ax=%.6f, ay=%.6f, az=%.6f | ", lastRawX, lastRawY, lastRawZ);
+
+            sendHavBlePacket(ahwx, ahwy, ahwz, ahv, sampleCount);
+
+            // Reset accumulators
+            sumX2 = 0.0f;
+            sumY2 = 0.0f;
+            sumZ2 = 0.0f;
+            sampleCount = 0;
+        }
+    }
+}
