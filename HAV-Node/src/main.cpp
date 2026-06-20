@@ -44,6 +44,7 @@
 // DEBUG CONFIGURATION
 // =============================================================================
 #define DEBUG_ENABLED      1
+#define SIMULATE_ADXL345   1
 
 #if DEBUG_ENABLED
   #define LOG_I(tag, fmt, ...)  Serial.printf("[INFO][%s] " fmt "\n", tag, ##__VA_ARGS__)
@@ -474,7 +475,12 @@ void setup() {
     Serial.println("  Design Configuration: No RTC, no SD, no OLED             ");
     Serial.println("==========================================================");
 
+#if SIMULATE_ADXL345
+    adxlAvailable = true;
+    LOG_I("INIT", "ADXL345 HAV is SIMULATED");
+#else
     adxlAvailable = setupADXL345();
+#endif
 
     if (!adxlAvailable) {
         LOG_E("INIT", "ADXL345 HAV sensor initialization FAILED.");
@@ -523,6 +529,13 @@ void loop() {
         float ax = 0.0f, ay = 0.0f, az = 0.0f;
 
         // ── Sensor Read ──────────────────────────────────────────────────────
+#if SIMULATE_ADXL345
+        // Generate a 20 Hz sine wave for simulated HAV data, amplitude 1.5 m/s²
+        const float t = (float)nowUsX100 / 1000000.0f;
+        ax = 1.5f * sinf(2.0f * PI * 20.0f * t);
+        ay = 0.5f * cosf(2.0f * PI * 15.0f * t);
+        az = 0.2f * sinf(2.0f * PI * 10.0f * t);
+#else
         if (!readADXL345(ax, ay, az)) {
             const uint32_t nowMs = millis();
             if (nowMs - lastErrorPrintMs >= 1000) {
@@ -536,6 +549,7 @@ void loop() {
             }
             return;
         }
+#endif
 
         lastRawX = ax;
         lastRawY = ay;

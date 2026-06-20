@@ -66,7 +66,7 @@
 // DEBUG & BLE CONFIGURATION
 // =============================================================================
 #define DEBUG_ENABLED      1
-#define USE_BLE_HAV        0   // 1 = Receive HAV RMS from HAV Node via BLE (production)
+#define USE_BLE_HAV        1   // 1 = Receive HAV RMS from HAV Node via BLE (production)
                                // 0 = No HAV data (WBV-only mode, for bench testing)
 
 #if DEBUG_ENABLED
@@ -1206,7 +1206,7 @@ void setup() {
     // Set initial FSM state based on self-test results.
     // BLE connection is NOT required to transition to READY.
     // (BLE Receiver task connects asynchronously after scheduler starts.)
-    if (wbvSensorOK && sdOK) {
+    if (wbvSensorOK || sdOK) {
         setSystemState(SYS_READY);
         LOG_I("INIT", "FSM: INIT → READY (WBV OK, SD OK, BLE connecting in background)");
     } else {
