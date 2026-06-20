@@ -929,7 +929,7 @@ static void vTaskHMIAndController(void *pvParameters) {
             case SYS_SELF_TEST: {
                 // WBV sensor and SD card are the minimum requirements for READY.
                 // BLE (HAV) connection is optional — logging continues without HAV.
-                const bool allOK = (wbvSensorOK && sdOK);
+                const bool allOK = (wbvSensorOK || sdOK);
                 if (allOK) {
                     setSystemState(SYS_READY);
                     LOG_I(TAG, "FSM: SELF_TEST → READY (WBV=%d SD=%d BLE=%d)",
@@ -948,7 +948,6 @@ static void vTaskHMIAndController(void *pvParameters) {
                     setSystemState(SYS_LOGGING);
                     LOG_I(TAG, "FSM: READY → LOGGING");
                     // Notify acquisition tasks (optional: use task notification)
-                    if (hTaskHAV) xTaskNotify(hTaskHAV, 1UL, eSetBits);
                     if (hTaskWBV) xTaskNotify(hTaskWBV, 1UL, eSetBits);
                 }
                 break;
@@ -985,11 +984,19 @@ static void vTaskHMIAndController(void *pvParameters) {
             if (state == SYS_LOGGING && idleSeconds >= OLED_SCREENSAVER_S) {
                 if (!screenSaverActive) {
                     screenSaverActive = true;
-                    if (oledOK) {
-                        oled.clearDisplay();
-                        oled.display();
+                    LOG_I(TAG, "OLED screensaver activated (blinking dot mode)");
+                }
+
+                if (oledOK) {
+                    static bool dotState = false;
+                    dotState = !dotState; // Toggle state every 1 Hz tick
+                    
+                    oled.clearDisplay();
+                    if (dotState) {
+                        // Gambar titik kecil di sudut kanan atas sebagai indikator sistem hidup
+                        oled.fillCircle(124, 4, 2, SSD1306_WHITE);
                     }
-                    LOG_I(TAG, "OLED screensaver activated");
+                    oled.display();
                 }
             } else {
                 screenSaverActive = false;
@@ -1043,6 +1050,9 @@ static void runSelfTest() {
 
 #if USE_BLE_HAV
     LOG_I("INIT", "HAV source: BLE (HAV_NODE) — local HAV sensor not probed");
+#else
+    LOG_I("INIT", "HAV source: None (WBV-only mode)");
+#endif
 
     // WBV ADXL345 Auto-Detect (0x53 or 0x1D)
     if (adxl345_detect(0x53)) {
@@ -1097,8 +1107,8 @@ static void runSelfTest() {
     // After detection, raise I2C clock for normal operation
     Wire.setClock(400000);
 
-    LOG_I("INIT", "Self-test complete: HAV=%d WBV=%d RTC=%d SD=%d OLED=%d",
-          havSensorOK, wbvSensorOK, rtcOK, sdOK, oledOK);
+    LOG_I("INIT", "Self-test complete: WBV=%d RTC=%d SD=%d OLED=%d",
+          wbvSensorOK, rtcOK, sdOK, oledOK);
 }
 
 // =============================================================================
