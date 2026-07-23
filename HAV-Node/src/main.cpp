@@ -44,7 +44,7 @@
 // DEBUG CONFIGURATION
 // =============================================================================
 #define DEBUG_ENABLED      1
-#define SIMULATE_ADXL345   1
+#define SIMULATE_ADXL345   0
 
 #if DEBUG_ENABLED
   #define LOG_I(tag, fmt, ...)  Serial.printf("[INFO][%s] " fmt "\n", tag, ##__VA_ARGS__)

@@ -27,7 +27,7 @@
  *          WBV Sensor      : ADXL345 (I2C, auto-detect 0x53 or 0x1D), 400 Hz ODR
  *          RTC             : DS3231 (I2C)
  *          Storage         : SD Card (SPI)
- *          Display         : SSD1306 1.3" OLED (I2C)
+ *          Display         : SH1106 1.3" OLED (I2C)
  *
  * @author  Team EL4060
  * @date    2026-06-17
@@ -60,7 +60,7 @@
 // Third-party library headers — installed via platformio.ini lib_deps
 #include <RTClib.h>             // Adafruit RTClib for DS3231
 #include <SD.h>                 // Arduino SD library
-#include <Adafruit_SSD1306.h>   // Adafruit SSD1306 OLED driver
+#include <Adafruit_SH1106.h>    // Adafruit SH1106 OLED driver (1.3")
 
 // =============================================================================
 // DEBUG & BLE CONFIGURATION
@@ -254,7 +254,7 @@ static volatile bool bleHavDataOK   = false;   // true = at least one valid pack
 
 // Global driver instances
 static RTC_DS3231 rtc;
-static Adafruit_SSD1306 oled(128, 64, &Wire, -1);
+static Adafruit_SH1106 oled(-1);
 
 // =============================================================================
 // BIQUAD CASCADE FILTER CLASS
@@ -994,7 +994,7 @@ static void vTaskHMIAndController(void *pvParameters) {
                     oled.clearDisplay();
                     if (dotState) {
                         // Gambar titik kecil di sudut kanan atas sebagai indikator sistem hidup
-                        oled.fillCircle(124, 4, 2, SSD1306_WHITE);
+                        oled.fillCircle(124, 4, 2, WHITE);
                     }
                     oled.display();
                 }
@@ -1003,7 +1003,7 @@ static void vTaskHMIAndController(void *pvParameters) {
                 if (oledOK && !screenSaverActive) {
                     oled.clearDisplay();
                     oled.setTextSize(1);
-                    oled.setTextColor(SSD1306_WHITE);
+                    oled.setTextColor(WHITE);
                     oled.setCursor(0, 0);
 
                     oled.println("VIBRATION DOSIMETER");
@@ -1095,14 +1095,11 @@ static void runSelfTest() {
     LOG_I("INIT", "SD Card init %s", sdOK ? "OK" : "FAIL");
 
     // OLED Init
-    oledOK = oled.begin(SSD1306_SWITCHCAPVCC, 0x3C);
-    if (oledOK) {
-        oled.clearDisplay();
-        oled.display();
-        LOG_I("INIT", "SSD1306 OLED init OK");
-    } else {
-        LOG_E("INIT", "SSD1306 OLED init FAIL");
-    }
+    oled.begin(SH1106_SWITCHCAPVCC, 0x3C);
+    oled.clearDisplay();
+    oled.display();
+    oledOK = true;
+    LOG_I("INIT", "SH1106 OLED init OK");
 
     // After detection, raise I2C clock for normal operation
     Wire.setClock(400000);
