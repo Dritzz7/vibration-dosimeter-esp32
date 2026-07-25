@@ -60,7 +60,7 @@
 // Third-party library headers — installed via platformio.ini lib_deps
 #include <RTClib.h>             // Adafruit RTClib for DS3231
 #include <SD.h>                 // Arduino SD library
-#include <Adafruit_SH1106.h>    // Adafruit SH1106 OLED driver (1.3")
+#include <Adafruit_SH110X.h>    // Official Adafruit SH110X OLED driver (for SH1106 1.3")
 
 // =============================================================================
 // DEBUG & BLE CONFIGURATION
@@ -254,7 +254,7 @@ static volatile bool bleHavDataOK   = false;   // true = at least one valid pack
 
 // Global driver instances
 static RTC_DS3231 rtc;
-static Adafruit_SH1106 oled(-1);
+static Adafruit_SH1106G oled(128, 64, &Wire, -1);
 
 // =============================================================================
 // BIQUAD CASCADE FILTER CLASS
@@ -488,8 +488,8 @@ static void parseAndEnqueueHavPayload(const char *payload) {
     if (xQueueSend(xQueueHAVData, &result, 0) != pdTRUE) {
         LOG_W("BLE_RX", "xQueueHAVData full — BLE HAV epoch dropped (seq=%lu)", seq);
     } else {
-        LOG_I("BLE_RX", "seq=%lu ahv=%.4f m/s2 | ahwx=%.4f ahwy=%.4f ahwz=%.4f | n=%lu",
-              seq, ahv, ahwx, ahwy, ahwz, nSamples);
+        LOG_I("HAV_ACQ", "ahv=%.4f m/s2 | ahwx=%.4f ahwy=%.4f ahwz=%.4f | n=%lu (seq=%lu)",
+              ahv, ahwx, ahwy, ahwz, nSamples, seq);
     }
 }
 
@@ -834,10 +834,16 @@ static void vTaskDataLogger(void *pvParameters) {
                 }
             }
 
-            LOG_I(TAG, "LOGGER t=%lu | HAV ahv=%.4f | WBV av=%.4f",
+            LOG_I(TAG, "LOGGER t=%lu | HAV ahv=%.4f (x=%.4f y=%.4f z=%.4f) | WBV av=%.4f (x=%.4f y=%.4f z=%.4f)",
                   ts,
-                  havReceived ? havData.ahv : 0.0f,
-                  wbvReceived ? wbvData.av  : 0.0f);
+                  havReceived ? havData.ahv  : 0.0f,
+                  havReceived ? havData.ahwx : 0.0f,
+                  havReceived ? havData.ahwy : 0.0f,
+                  havReceived ? havData.ahwz : 0.0f,
+                  wbvReceived ? wbvData.av   : 0.0f,
+                  wbvReceived ? wbvData.awx  : 0.0f,
+                  wbvReceived ? wbvData.awy  : 0.0f,
+                  wbvReceived ? wbvData.awz  : 0.0f);
         }
     }
 }
@@ -994,7 +1000,7 @@ static void vTaskHMIAndController(void *pvParameters) {
                     oled.clearDisplay();
                     if (dotState) {
                         // Gambar titik kecil di sudut kanan atas sebagai indikator sistem hidup
-                        oled.fillCircle(124, 4, 2, WHITE);
+                        oled.fillCircle(124, 4, 2, SH110X_WHITE);
                     }
                     oled.display();
                 }
@@ -1003,7 +1009,7 @@ static void vTaskHMIAndController(void *pvParameters) {
                 if (oledOK && !screenSaverActive) {
                     oled.clearDisplay();
                     oled.setTextSize(1);
-                    oled.setTextColor(WHITE);
+                    oled.setTextColor(SH110X_WHITE);
                     oled.setCursor(0, 0);
 
                     oled.println("VIBRATION DOSIMETER");
@@ -1095,11 +1101,14 @@ static void runSelfTest() {
     LOG_I("INIT", "SD Card init %s", sdOK ? "OK" : "FAIL");
 
     // OLED Init
-    oled.begin(SH1106_SWITCHCAPVCC, 0x3C);
-    oled.clearDisplay();
-    oled.display();
-    oledOK = true;
-    LOG_I("INIT", "SH1106 OLED init OK");
+    oledOK = oled.begin(0x3C, true);
+    if (oledOK) {
+        oled.clearDisplay();
+        oled.display();
+        LOG_I("INIT", "SH1106 OLED init OK");
+    } else {
+        LOG_E("INIT", "SH1106 OLED init FAIL");
+    }
 
     // After detection, raise I2C clock for normal operation
     Wire.setClock(400000);
