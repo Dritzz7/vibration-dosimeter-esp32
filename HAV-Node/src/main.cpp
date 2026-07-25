@@ -259,13 +259,30 @@ bool readMultipleRegisters(uint8_t addr, uint8_t startReg, uint8_t *buffer, uint
 // =============================================================================
 /**
  * @brief Scan for ADXL345 sensor address (0x53 or 0x1D) and verify Device ID.
+ *        Includes full I2C bus scan for hardware troubleshooting.
  * @return true if detected, false otherwise.
  */
 bool detectADXL345() {
+    LOG_I("I2C_SCAN", "Scanning I2C bus (SDA=GPIO%d, SCL=GPIO%d)...", PIN_I2C_SDA, PIN_I2C_SCL);
+    uint8_t devicesFound = 0;
+
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            LOG_I("I2C_SCAN", "  -> I2C device found at address 0x%02X", addr);
+            devicesFound++;
+        }
+    }
+
+    if (devicesFound == 0) {
+        LOG_E("I2C_SCAN", "No I2C devices found on bus! Check SDA/SCL wiring and VCC power.");
+    }
+
     uint8_t devid = 0;
 
     // Check primary address 0x53
     if (readRegister(ADXL345_ADDR_1, REG_DEVID, devid)) {
+        LOG_I("INIT", "Found device at 0x53, REG_DEVID = 0x%02X (Expected 0xE5)", devid);
         if (devid == ADXL345_DEVID_VALUE) {
             adxlAddress = ADXL345_ADDR_1;
             return true;
@@ -274,6 +291,7 @@ bool detectADXL345() {
 
     // Check secondary address 0x1D
     if (readRegister(ADXL345_ADDR_2, REG_DEVID, devid)) {
+        LOG_I("INIT", "Found device at 0x1D, REG_DEVID = 0x%02X (Expected 0xE5)", devid);
         if (devid == ADXL345_DEVID_VALUE) {
             adxlAddress = ADXL345_ADDR_2;
             return true;
@@ -289,6 +307,17 @@ bool detectADXL345() {
  * @return true on successful configuration.
  */
 bool setupADXL345() {
+    // Pre-check line states for hardware diagnostic
+    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+    pinMode(PIN_I2C_SCL, INPUT_PULLUP);
+    delayMicroseconds(50);
+    int sdaVal = digitalRead(PIN_I2C_SDA);
+    int sclVal = digitalRead(PIN_I2C_SCL);
+
+    LOG_I("I2C_SCAN", "Idle I2C Line States: SDA(GPIO%d)=%s, SCL(GPIO%d)=%s",
+          PIN_I2C_SDA, sdaVal ? "HIGH (OK)" : "LOW (SHORT/GROUNDED!)",
+          PIN_I2C_SCL, sclVal ? "HIGH (OK)" : "LOW (SHORT/GROUNDED!)");
+
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
     Wire.setClock(100000); // Start with 100 kHz I2C clock for initialization
 
@@ -385,6 +414,7 @@ class HavBleServerCallbacks : public BLEServerCallbacks {
  */
 void setupBLE() {
     BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(128);
 
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new HavBleServerCallbacks());
@@ -436,7 +466,7 @@ void sendHavBlePacket(float ahwx, float ahwy, float ahwz, float ahv, uint16_t nS
     const uint32_t nowMs = millis();
 
     snprintf(payload, sizeof(payload),
-             "HAV,%lu,%lu,%.6f,%.6f,%.6f,%.6f,%u",
+             "HAV,%lu,%lu,%.4f,%.4f,%.4f,%.4f,%u",
              packetCounter,
              nowMs,
              ahwx,

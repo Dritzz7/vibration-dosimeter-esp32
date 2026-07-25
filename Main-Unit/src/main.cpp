@@ -416,6 +416,29 @@ static uint32_t rtc_getUnixTimestamp() {
     return ts;
 }
 
+/**
+ * @brief  Read current date-time from DS3231 via I2C formatted as YYYY-MM-DD HH:MM:SS (WIB).
+ * @param[out] buf     Buffer to store formatted string.
+ * @param      bufLen  Buffer length.
+ */
+static void rtc_getFormattedTime(char *buf, size_t bufLen) {
+    if (xSemaphoreTake(xMutexRTC, pdMS_TO_TICKS(5)) == pdTRUE) {
+        if (rtcOK) {
+            DateTime now = rtc.now();
+            snprintf(buf, bufLen, "%04d-%02d-%02d %02d:%02d:%02d",
+                     now.year(), now.month(), now.day(),
+                     now.hour(), now.minute(), now.second());
+        } else {
+            uint32_t sec = (uint32_t)(millis() / 1000UL);
+            snprintf(buf, bufLen, "U+%lu", sec);
+        }
+        xSemaphoreGive(xMutexRTC);
+    } else {
+        uint32_t sec = (uint32_t)(millis() / 1000UL);
+        snprintf(buf, bufLen, "U+%lu", sec);
+    }
+}
+
 // =============================================================================
 // SYSTEM STATE HELPER (mutex-protected read/write)
 // =============================================================================
@@ -544,6 +567,7 @@ static void vTaskBLEReceiver(void *pvParameters) {
     LOG_I(TAG, "BLE Receiver task started on Core %d", xPortGetCoreID());
 
     BLEDevice::init("");   // Initialise BLE stack (client mode, no name needed)
+    BLEDevice::setMTU(128);
     doScan = true;
 
     while (true) {
@@ -590,6 +614,7 @@ static void vTaskBLEReceiver(void *pvParameters) {
             }
 
             LOG_I(TAG, "Connected to HAV Node.");
+            pBleClient->setMTU(128);
 
             // Get the remote service
             BLERemoteService *pRemoteService =
@@ -803,9 +828,10 @@ static void vTaskDataLogger(void *pvParameters) {
             wbvReceived = true;
         }
 
-        // ── SD Write ──────────────────────────────────────────────────────────
+        // ── SD Write & Log ───────────────────────────────────────────────────
         if (havReceived || wbvReceived) {
-            const uint32_t ts = rtc_getUnixTimestamp();
+            char timeStr[32];
+            rtc_getFormattedTime(timeStr, sizeof(timeStr));
 
             if (sdOK) {
                 // Take mutex to guard SPI bus if other tasks use SPI
@@ -813,10 +839,10 @@ static void vTaskDataLogger(void *pvParameters) {
                     File f = SD.open("/dosimeter.csv", FILE_APPEND);
                     if (f) {
                         // Compose CSV line
-                        char line[128];
+                        char line[160];
                         snprintf(line, sizeof(line),
-                                 "%lu,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
-                                 ts,
+                                 "%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                                 timeStr,
                                  havReceived ? havData.ahwx : 0.0f,
                                  havReceived ? havData.ahwy : 0.0f,
                                  havReceived ? havData.ahwz : 0.0f,
@@ -834,8 +860,8 @@ static void vTaskDataLogger(void *pvParameters) {
                 }
             }
 
-            LOG_I(TAG, "LOGGER t=%lu | HAV ahv=%.4f (x=%.4f y=%.4f z=%.4f) | WBV av=%.4f (x=%.4f y=%.4f z=%.4f)",
-                  ts,
+            LOG_I(TAG, "LOGGER t=%s | HAV ahv=%.4f (x=%.4f y=%.4f z=%.4f) | WBV av=%.4f (x=%.4f y=%.4f z=%.4f)",
+                  timeStr,
                   havReceived ? havData.ahv  : 0.0f,
                   havReceived ? havData.ahwx : 0.0f,
                   havReceived ? havData.ahwy : 0.0f,
