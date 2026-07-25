@@ -544,6 +544,19 @@ class HavAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
     }
 };
 
+class HavBleClientCallbacks : public BLEClientCallbacks {
+    void onConnect(BLEClient *pclient) override {
+        LOG_I("BLE_RX", "BLE GATT client connected successfully.");
+    }
+
+    void onDisconnect(BLEClient *pclient) override {
+        bleConnected = false;
+        bleHavDataOK = false;
+        doScan       = true;
+        LOG_W("BLE_RX", "BLE GATT client disconnected. Rescanning queued.");
+    }
+};
+
 // =============================================================================
 // TASK: vTaskBLEReceiver
 // Core 1 | Priority 3 | Event-driven (blocks on BLE callbacks)
@@ -571,10 +584,9 @@ static void vTaskBLEReceiver(void *pvParameters) {
     doScan = true;
 
     while (true) {
-        // ── 1. Initiate Scan ─────────────────────────────────────────────────
-        if (doScan) {
+        // ── 1. Initiate Scan (only when disconnected) ───────────────────────
+        if (doScan && !bleConnected) {
             doScan = false;
-            bleConnected = false;
 
             LOG_I(TAG, "Scanning for %s ...", BLE_HAV_DEVICE_NAME);
             BLEScan *pScan = BLEDevice::getScan();
@@ -583,8 +595,9 @@ static void vTaskBLEReceiver(void *pvParameters) {
             pScan->setInterval(100);
             pScan->setWindow(99);
             pScan->start(BLE_SCAN_DURATION_S, false);
+            pScan->clearResults();
 
-            if (!doConnect) {
+            if (!doConnect && !bleConnected) {
                 // Not found in this scan window — wait, then retry
                 LOG_W(TAG, "HAV Node not found. Retrying in %d ms...", BLE_RECONNECT_MS);
                 vTaskDelay(pdMS_TO_TICKS(BLE_RECONNECT_MS));
@@ -593,7 +606,7 @@ static void vTaskBLEReceiver(void *pvParameters) {
         }
 
         // ── 2. Connect & Subscribe ───────────────────────────────────────────
-        if (doConnect && pFoundDevice != nullptr) {
+        if (doConnect && pFoundDevice != nullptr && !bleConnected) {
             doConnect = false;
 
             if (pBleClient != nullptr) {
@@ -601,6 +614,7 @@ static void vTaskBLEReceiver(void *pvParameters) {
                 delete pBleClient;
             }
             pBleClient = BLEDevice::createClient();
+            pBleClient->setClientCallbacks(new HavBleClientCallbacks());
 
             LOG_I(TAG, "Connecting to HAV Node...");
 
@@ -655,11 +669,12 @@ static void vTaskBLEReceiver(void *pvParameters) {
         // ── 3. Monitor Connection ────────────────────────────────────────────
         if (bleConnected) {
             if (pBleClient == nullptr || !pBleClient->isConnected()) {
-                // Connection dropped
-                bleConnected  = false;
-                bleHavDataOK  = false;
-                LOG_W(TAG, "BLE disconnected from HAV Node. Rescanning...");
-                doScan = true;
+                if (bleConnected) {
+                    bleConnected  = false;
+                    bleHavDataOK  = false;
+                    doScan        = true;
+                    LOG_W(TAG, "BLE connection lost. Rescanning...");
+                }
             }
         }
 
