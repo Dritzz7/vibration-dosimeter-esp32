@@ -40,6 +40,9 @@
 // Project filter coefficient headers (MATLAB-generated, ISO 8041)
 #include "hav_coefficients.h"
 
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+
 // =============================================================================
 // DEBUG CONFIGURATION
 // =============================================================================
@@ -492,6 +495,10 @@ void sendHavBlePacket(float ahwx, float ahwy, float ahwz, float ahv, uint16_t nS
 // ARDUINO SETUP — Runs once on Core 1 before the loop
 // =============================================================================
 void setup() {
+
+    // Disable brownout reset
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
 #if DEBUG_ENABLED
     Serial.begin(115200);
     delay(500); // Short settling delay
