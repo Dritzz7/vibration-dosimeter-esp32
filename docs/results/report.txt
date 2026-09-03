@@ -1,0 +1,42 @@
+===============================================================================
+               VIBRATION DOSIMETER ANALYSIS REPORT
+               Standards: ISO 5349-1 (HAV) | ISO 2631-1 (WBV)
+===============================================================================
+Input Log File   : f:\dosimeter.csv
+Total Logged Time: 00h 01m 34s (94 seconds / 94 samples @ 1 Hz)
+Report Generated : 2026-09-03 19:33:32
+-------------------------------------------------------------------------------
+
+1. HAND-ARM VIBRATION (HAV) ANALYSIS (ISO 5349-1)
+-------------------------------------------------------------------------------
+  * RMS Acceleration (Equiv):
+      ahwx_eq = 0.8102 m/s² | ahwy_eq = 0.5075 m/s² | ahwz_eq = 0.8690 m/s²
+      ahv_eq  (Vector Total) = 1.2920 m/s²
+  * 8-Hour Daily Exposure A_HAV(8):
+      A_HAV(8) Vector Total  = 0.0738 m/s²
+      [Per-axis: Ax(8)=0.0463, Ay(8)=0.0290, Az(8)=0.0496]
+  * ISO 5349-1 Safety Limits:
+      EAV Threshold (Action) = 2.50 m/s² | Time allowed = 29h 57m 19s
+      ELV Threshold (Limit)  = 5.00 m/s² | Time allowed = 119h 49m 18s
+  * Exposure Compliance Status: OK (SAFE)
+
+2. WHOLE-BODY VIBRATION (WBV) ANALYSIS (ISO 2631-1)
+-------------------------------------------------------------------------------
+  * RMS Acceleration (Unweighted Equiv):
+      awx_eq = 0.6843 m/s² | awy_eq = 0.6906 m/s² | awz_eq = 1.8967 m/s²
+  * Directional Weighted RMS (kx=1.4, ky=1.4, kz=1.0 for seated):
+      1.4*awx = 0.9581 m/s² | 1.4*awy = 0.9669 m/s² | 1.0*awz = 1.8967 m/s²
+  * 8-Hour Daily Exposure A_WBV(8):
+      A_x(8) = 0.0547 m/s² | A_y(8) = 0.0552 m/s² | A_z(8) = 0.1084 m/s²
+      Dominant Axis A_WBV(8) = 0.1084 m/s² (Axis Z)
+      Vector Total A_v(8)   = 0.1334 m/s²
+  * Vibration Dose Value (VDV) 4th-Power Method:
+      VDV_x = 5.7868 m/s^1.75 | VDV_y = 4.2414 m/s^1.75 | VDV_z = 7.6066 m/s^1.75
+      VDV Total Combined    = 8.3205 m/s^1.75
+      Estimated VDV (eVDV)  = 10.1768 m/s^1.75
+  * ISO 2631-1 Safety Limits:
+      A(8) EAV = 0.50 m/s²  | Time allowed = 00h 33m 21s
+      A(8) ELV = 1.15 m/s²  | Time allowed = 02h 56m 27s
+      VDV  EAV = 9.1 m/s^1.75 | VDV ELV = 21.0 m/s^1.75
+  * Exposure Compliance Status: OK (SAFE)
+===============================================================================

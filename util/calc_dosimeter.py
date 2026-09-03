@@ -293,10 +293,135 @@ def generate_report(file_path, m):
     return "\n".join(lines)
 
 
+def plot_metrics(records, m, file_path, save_path=None, show_plot=True):
+    """
+    Generate a 4-panel ISO 5349-1 and ISO 2631-1 vibration visualization dashboard.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("\n[WARN] matplotlib is not installed. To view visualization plots, install via: pip install matplotlib")
+        return
+
+    N = len(records)
+    time_s = np.arange(N)
+
+    # Extract series
+    ahwx = np.array([r['ahwx'] for r in records])
+    ahwy = np.array([r['ahwy'] for r in records])
+    ahwz = np.array([r['ahwz'] for r in records])
+    ahv  = np.array([r['ahv']  for r in records])
+
+    awx  = np.array([r['awx']  for r in records])
+    awy  = np.array([r['awy']  for r in records])
+    awz  = np.array([r['awz']  for r in records])
+    av   = np.array([r['av']   for r in records])
+
+    # Compute cumulative metrics over time
+    cum_ahv_sq = np.cumsum(ahv ** 2)
+    cum_A8_hav = np.sqrt(cum_ahv_sq / T_8H_SEC)
+
+    cum_awx_sq = np.cumsum(awx ** 2)
+    cum_awy_sq = np.cumsum(awy ** 2)
+    cum_awz_sq = np.cumsum(awz ** 2)
+    cum_A8_wbv_x = KX_WBV * np.sqrt(cum_awx_sq / T_8H_SEC)
+    cum_A8_wbv_y = KY_WBV * np.sqrt(cum_awy_sq / T_8H_SEC)
+    cum_A8_wbv_z = KZ_WBV * np.sqrt(cum_awz_sq / T_8H_SEC)
+    cum_A8_wbv_dom = np.maximum(cum_A8_wbv_x, np.maximum(cum_A8_wbv_y, cum_A8_wbv_z))
+
+    cum_awx_4 = np.cumsum(awx ** 4)
+    cum_awy_4 = np.cumsum(awy ** 4)
+    cum_awz_4 = np.cumsum(awz ** 4)
+    cum_vdv_x = KX_WBV * (cum_awx_4 ** 0.25)
+    cum_vdv_y = KY_WBV * (cum_awy_4 ** 0.25)
+    cum_vdv_z = KZ_WBV * (cum_awz_4 ** 0.25)
+    cum_vdv_tot = (cum_vdv_x**4 + cum_vdv_y**4 + cum_vdv_z**4) ** 0.25
+
+    fig, axs = plt.subplots(2, 2, figsize=(14, 9))
+    fig.suptitle(f"Vibration Dosimeter Analysis Dashboard\nFile: {file_path} (Duration: {format_duration(m['T_total_sec'])})",
+                 fontsize=14, fontweight='bold')
+
+    # ── Panel 1: HAV Time Series (ISO 5349-1) ─────────────────────────────────
+    ax1 = axs[0, 0]
+    ax1.plot(time_s, ahwx, label="ahwx (X)", color="#1f77b4", alpha=0.7, lw=1.2)
+    ax1.plot(time_s, ahwy, label="ahwy (Y)", color="#2ca02c", alpha=0.7, lw=1.2)
+    ax1.plot(time_s, ahwz, label="ahwz (Z)", color="#ff7f0e", alpha=0.7, lw=1.2)
+    ax1.plot(time_s, ahv,  label="ahv (Vector Total)", color="#d62728", lw=1.8)
+    ax1.axhline(m['ahv_eq'], color="#8c564b", linestyle="--", lw=1.2,
+                label=f"ahv_eq ({m['ahv_eq']:.2f} m/s²)")
+    ax1.set_title("1. Hand-Arm Vibration (HAV) — 1 Hz Weighted RMS (ISO 5349-1)", fontweight='bold', fontsize=11)
+    ax1.set_xlabel("Elapsed Time (seconds)")
+    ax1.set_ylabel("Acceleration RMS [m/s²]")
+    ax1.grid(True, linestyle=":", alpha=0.6)
+    ax1.legend(loc="upper right", fontsize=8)
+
+    # ── Panel 2: WBV Time Series (ISO 2631-1) ─────────────────────────────────
+    ax2 = axs[0, 1]
+    ax2.plot(time_s, awx, label="awx (X)", color="#1f77b4", alpha=0.7, lw=1.2)
+    ax2.plot(time_s, awy, label="awy (Y)", color="#2ca02c", alpha=0.7, lw=1.2)
+    ax2.plot(time_s, awz, label="awz (Z)", color="#ff7f0e", alpha=0.7, lw=1.2)
+    ax2.plot(time_s, av,  label="av (Vector Total)", color="#9467bd", lw=1.8)
+    ax2.axhline(m['av_eq'], color="#8c564b", linestyle="--", lw=1.2,
+                label=f"av_eq ({m['av_eq']:.2f} m/s²)")
+    ax2.set_title("2. Whole-Body Vibration (WBV) — 1 Hz Weighted RMS (ISO 2631-1)", fontweight='bold', fontsize=11)
+    ax2.set_xlabel("Elapsed Time (seconds)")
+    ax2.set_ylabel("Acceleration RMS [m/s²]")
+    ax2.grid(True, linestyle=":", alpha=0.6)
+    ax2.legend(loc="upper right", fontsize=8)
+
+    # ── Panel 3: Progressive A(8) Exposure vs ISO Limits ──────────────────────
+    ax3 = axs[1, 0]
+    ax3.plot(time_s, cum_A8_hav, label="A_HAV(8) Cumulative", color="#d62728", lw=2)
+    ax3.plot(time_s, cum_A8_wbv_dom, label=f"A_WBV(8) Dominant ({m['dominant_axis']})", color="#1f77b4", lw=2)
+
+    # Threshold lines
+    ax3.axhline(HAV_EAV_A8, color="#e377c2", linestyle="--", lw=1.4, label=f"HAV EAV ({HAV_EAV_A8} m/s²)")
+    ax3.axhline(HAV_ELV_A8, color="#d62728", linestyle=":",  lw=1.6, label=f"HAV ELV ({HAV_ELV_A8} m/s²)")
+    ax3.axhline(WBV_EAV_A8, color="#ff7f0e", linestyle="--", lw=1.4, label=f"WBV EAV ({WBV_EAV_A8} m/s²)")
+    ax3.axhline(WBV_ELV_A8, color="#7f7f7f", linestyle=":",  lw=1.6, label=f"WBV ELV ({WBV_ELV_A8} m/s²)")
+
+    ax3.set_title("3. Progressive Daily Exposure A(8) vs ISO Limits", fontweight='bold', fontsize=11)
+    ax3.set_xlabel("Elapsed Time (seconds)")
+    ax3.set_ylabel("A(8) Exposure [m/s²]")
+    ax3.grid(True, linestyle=":", alpha=0.6)
+    ax3.legend(loc="upper left", fontsize=8)
+
+    # ── Panel 4: Progressive VDV vs ISO 2631-1 Limits ─────────────────────────
+    ax4 = axs[1, 1]
+    ax4.plot(time_s, cum_vdv_x,   label="VDV_x (1.4*X)", color="#1f77b4", alpha=0.7, lw=1.2)
+    ax4.plot(time_s, cum_vdv_y,   label="VDV_y (1.4*Y)", color="#2ca02c", alpha=0.7, lw=1.2)
+    ax4.plot(time_s, cum_vdv_z,   label="VDV_z (1.0*Z)", color="#ff7f0e", alpha=0.7, lw=1.2)
+    ax4.plot(time_s, cum_vdv_tot, label="VDV Total Combined", color="#9467bd", lw=2)
+
+    ax4.axhline(WBV_EAV_VDV, color="#d62728", linestyle="--", lw=1.4, label=f"VDV EAV ({WBV_EAV_VDV} m/s^1.75)")
+    ax4.axhline(WBV_ELV_VDV, color="#8c564b", linestyle=":",  lw=1.6, label=f"VDV ELV ({WBV_ELV_VDV} m/s^1.75)")
+
+    ax4.set_title("4. Progressive Vibration Dose Value (VDV) 4th-Power", fontweight='bold', fontsize=11)
+    ax4.set_xlabel("Elapsed Time (seconds)")
+    ax4.set_ylabel("VDV [m/s^1.75]")
+    ax4.grid(True, linestyle=":", alpha=0.6)
+    ax4.legend(loc="upper left", fontsize=8)
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"[INFO] Plot image saved to: {save_path}")
+
+    if show_plot:
+        try:
+            plt.show()
+        except Exception as e:
+            print(f"[WARN] Unable to display GUI window (headless environment): {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Calculate A(8) and VDV metrics from dosimeter.csv log file.")
     parser.add_argument("file_path", nargs="?", default=None, help="Path to dosimeter.csv file (default: f:\\dosimeter.csv or ./dosimeter.csv)")
     parser.add_argument("-o", "--output", help="Optional output text file path to save the report")
+    parser.add_argument("-s", "--save-plot", help="Optional path to save visualization plot as an image (e.g. dosimeter_plot.png)")
+    parser.add_argument("--no-plot", action="store_true", help="Disable displaying interactive plot window")
     args = parser.parse_args()
 
     # Determine input path
@@ -322,6 +447,9 @@ def main():
             with open(args.output, "w", encoding="utf-8") as f_out:
                 f_out.write(report)
             print(f"\n[INFO] Report saved to: {args.output}")
+
+        # Visualization plot
+        plot_metrics(records, metrics, file_path, save_path=args.save_plot, show_plot=not args.no_plot)
 
     except Exception as e:
         print(f"Error processing dosimeter CSV file: {e}")
