@@ -781,6 +781,34 @@ static void vTaskWBVAcquisition(void *pvParameters) {
 // TASK: vTaskDataLogger
 // Core 1 | Priority 3 | Interval 1000 ms
 // =============================================================================
+// =============================================================================
+// SD CARD RE-INITIALISATION HELPER
+// =============================================================================
+static bool sd_reinit(void) {
+    if (xSemaphoreTake(xMutexSD, pdMS_TO_TICKS(100)) == pdTRUE) {
+        SD.end();
+        pinMode(PIN_SD_CS, OUTPUT);
+        digitalWrite(PIN_SD_CS, HIGH);
+        pinMode(PIN_SPI_MISO, INPUT_PULLUP);
+        
+        sdOK = SD.begin(PIN_SD_CS, SPI, 4000000);
+        if (!sdOK) {
+            sdOK = SD.begin(PIN_SD_CS, SPI, 1000000);
+        }
+        if (sdOK) {
+            if (!SD.exists("/dosimeter.csv")) {
+                File f = SD.open("/dosimeter.csv", FILE_WRITE);
+                if (f) {
+                    f.println("timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av");
+                    f.close();
+                }
+            }
+        }
+        xSemaphoreGive(xMutexSD);
+    }
+    return sdOK;
+}
+
 /**
  * @brief  Data Logger task — Core 1, Priority 3.
  *
@@ -793,6 +821,7 @@ static void vTaskWBVAcquisition(void *pvParameters) {
  *
  *         Fail-safe: The file is closed (flushed) after every write batch.
  *         This prevents data loss on unexpected power loss.
+ *         If writing fails 3 consecutive times, unmounts SD and transitions to SYS_ERROR.
  */
 static void vTaskDataLogger(void *pvParameters) {
     static const char *TAG = "LOGGER";
@@ -803,6 +832,7 @@ static void vTaskDataLogger(void *pvParameters) {
 
     bool havReceived = false;
     bool wbvReceived = false;
+    uint8_t sdFailCount = 0;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
     const TickType_t xPeriod = pdMS_TO_TICKS(LOGGER_PERIOD_MS);
@@ -812,10 +842,12 @@ static void vTaskDataLogger(void *pvParameters) {
     // ── SD Card Initialisation ────────────────────────────────────────────────
     if (sdOK) {
         if (xSemaphoreTake(xMutexSD, pdMS_TO_TICKS(50)) == pdTRUE) {
-            File f = SD.open("/dosimeter.csv", FILE_WRITE);
-            if (f) {
-                f.println("timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av");
-                f.close();
+            if (!SD.exists("/dosimeter.csv")) {
+                File f = SD.open("/dosimeter.csv", FILE_WRITE);
+                if (f) {
+                    f.println("timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av");
+                    f.close();
+                }
             }
             xSemaphoreGive(xMutexSD);
         }
@@ -853,6 +885,7 @@ static void vTaskDataLogger(void *pvParameters) {
                 if (xSemaphoreTake(xMutexSD, pdMS_TO_TICKS(50)) == pdTRUE) {
                     File f = SD.open("/dosimeter.csv", FILE_APPEND);
                     if (f) {
+                        sdFailCount = 0; // Reset fail count on success
                         // Compose CSV line
                         char line[160];
                         snprintf(line, sizeof(line),
@@ -869,7 +902,14 @@ static void vTaskDataLogger(void *pvParameters) {
                         f.println(line);
                         f.close();  // Fail-safe flush on every write
                     } else { 
-                        LOG_E(TAG, "Cannot open CSV file for logging!"); 
+                        sdFailCount++;
+                        LOG_E(TAG, "Cannot open CSV file for logging! (Fail %u/3)", sdFailCount);
+                        if (sdFailCount >= 3) {
+                            LOG_E(TAG, "SD Card detached or unreadable! Unmounting and transitioning to SYS_ERROR.");
+                            sdOK = false;
+                            SD.end(); // Unmount filesystem to stop SPI timeouts and bus spam
+                            setSystemState(SYS_ERROR);
+                        }
                     }
                     xSemaphoreGive(xMutexSD);
                 }
@@ -974,6 +1014,11 @@ static void vTaskHMIAndController(void *pvParameters) {
 
             // ── SELF_TEST: Verify all peripherals ───────────────────────────
             case SYS_SELF_TEST: {
+                if (!sdOK) {
+                    LOG_I(TAG, "Re-probing SD card...");
+                    sd_reinit();
+                    LOG_I(TAG, "SD Card re-init result: %s", sdOK ? "OK" : "FAIL");
+                }
                 // WBV sensor and SD card are the minimum requirements for READY.
                 // BLE (HAV) connection is optional — logging continues without HAV.
                 const bool allOK = (wbvSensorOK || sdOK);
@@ -1121,9 +1166,15 @@ static void runSelfTest() {
     // DS3231 RTC Self-Test
     rtcOK = rtc.begin();
     LOG_I("INIT", "DS3231 RTC init %s", rtcOK ? "OK" : "NOT FOUND");
-    if (rtcOK && rtc.lostPower()) {
-        LOG_W("INIT", "RTC lost power, setting compilation time!");
-        rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+    if (rtcOK) {
+        DateTime now = rtc.now();
+        DateTime compiled = DateTime(F(__DATE__), F(__TIME__));
+        if (now < compiled || rtc.lostPower()) {
+            LOG_W("INIT", "RTC time (%04d-%02d-%02d %02d:%02d:%02d) is behind compile time! Updating to %04d-%02d-%02d %02d:%02d:%02d",
+                  now.year(), now.month(), now.day(), now.hour(), now.minute(), now.second(),
+                  compiled.year(), compiled.month(), compiled.day(), compiled.hour(), compiled.minute(), compiled.second());
+            rtc.adjust(compiled);
+        }
     }
 
     // SD Card Self-Test (with hardware mitigation for problematic modules)
