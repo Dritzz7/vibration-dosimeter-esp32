@@ -963,6 +963,7 @@ static void vTaskHMIAndController(void *pvParameters) {
     // ── OLED sub-rate counter and screen-saver timer ──────────────────────────
     uint32_t oledTickCounter   = 0;
     uint32_t lastActivityMs    = millis();
+    uint32_t lastSdCheckMs     = 0;
     bool     screenSaverActive = false;
 
     TickType_t xLastWakeTime = xTaskGetTickCount();
@@ -1019,9 +1020,9 @@ static void vTaskHMIAndController(void *pvParameters) {
                     sd_reinit();
                     LOG_I(TAG, "SD Card re-init result: %s", sdOK ? "OK" : "FAIL");
                 }
-                // WBV sensor and SD card are the minimum requirements for READY.
+                // WBV sensor and SD card are BOTH mandatory for READY.
                 // BLE (HAV) connection is optional — logging continues without HAV.
-                const bool allOK = (wbvSensorOK || sdOK);
+                const bool allOK = (wbvSensorOK && sdOK);
                 if (allOK) {
                     setSystemState(SYS_READY);
                     LOG_I(TAG, "FSM: SELF_TEST → READY (WBV=%d SD=%d BLE=%d)",
@@ -1036,11 +1037,28 @@ static void vTaskHMIAndController(void *pvParameters) {
 
             // ── READY: Waiting for user to start logging ─────────────────────
             case SYS_READY:
+                // Auto re-probe SD card if it was marked unready but card was plugged in
+                if (!sdOK && (now - lastSdCheckMs >= 2000UL)) {
+                    lastSdCheckMs = now;
+                    sd_reinit();
+                    if (sdOK) {
+                        LOG_I(TAG, "SD card auto-detected and mounted OK!");
+                    }
+                }
+
                 if (buttonEvent) {
-                    setSystemState(SYS_LOGGING);
-                    LOG_I(TAG, "FSM: READY → LOGGING");
-                    // Notify acquisition tasks (optional: use task notification)
-                    if (hTaskWBV) xTaskNotify(hTaskWBV, 1UL, eSetBits);
+                    if (!sdOK) {
+                        sd_reinit();
+                    }
+                    if (sdOK) {
+                        setSystemState(SYS_LOGGING);
+                        LOG_I(TAG, "FSM: READY → LOGGING");
+                        // Notify acquisition tasks (optional: use task notification)
+                        if (hTaskWBV) xTaskNotify(hTaskWBV, 1UL, eSetBits);
+                    } else {
+                        setSystemState(SYS_ERROR);
+                        LOG_E(TAG, "FSM: Cannot start logging! Returning to ERROR.");
+                    }
                 }
                 break;
 

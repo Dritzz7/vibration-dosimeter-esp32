@@ -107,6 +107,15 @@ static bool sd_reinit(void) {
 ```
 Saat pengguna memasang kembali kartu SD dan menekan tombol fisik, FSM masuk ke `SYS_SELF_TEST`. Jika `!sdOK`, fungsi `sd_reinit()` dipanggil secara otomatis. Jika kartu terdeteksi, status kembali ke `SD Card: OK` dan sistem siap digunakan kembali (`SYS_READY`).
 
+#### D. Penegakan Syarat Wajib SD & Gerbang Pengaman (*Safety Interlock*)
+Untuk mencegah sistem masuk ke mode `SYS_LOGGING` kosong tanpa kartu SD:
+1. **Syarat Wajib di `SYS_SELF_TEST`**:
+   Diubah dari `(wbvSensorOK || sdOK)` menjadi `(wbvSensorOK && sdOK)`. Jika kartu SD belum dipasang, sistem **menolak** masuk ke `SYS_READY` dan tetap bertahan di `SYS_ERROR`.
+2. **Auto Re-probe di `SYS_READY`**:
+   Saat sistem berada di `SYS_READY` dan `!sdOK`, task HMI secara otomatis melakukan re-probe setiap 2 detik. Begitu kartu ditancapkan, status OLED langsung berganti menjadi `SD Card: OK`.
+3. **Safety Interlock Menuju `SYS_LOGGING`**:
+   Saat tombol ditekan di `SYS_READY`, sistem memverifikasi ketersediaan SD card. Jika kartu tidak ada, sistem menolak merekam dan kembali ke `SYS_ERROR`.
+
 ---
 
 ## 3. Pencegahan Penghapusan Data Log Lama (*Append Protection*)
