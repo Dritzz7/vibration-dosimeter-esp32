@@ -40,6 +40,11 @@
 // Project filter coefficient headers (MATLAB-generated, ISO 8041)
 #include "hav_coefficients.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <math.h>
+
 #include "soc/soc.h"
 #include "soc/rtc_cntl_reg.h"
 
@@ -65,6 +70,49 @@
 // --- I2C Bus (shared: HAV sensor) ---
 #define PIN_I2C_SDA          21
 #define PIN_I2C_SCL          22
+
+// --- Battery ADC Monitoring (ADC1, safe with BLE) ---
+#define ENABLE_BATTERY_MONITOR 1     ///< Set 1 when battery divider is connected to GPIO34, 0 for USB bench testing
+#define PIN_VBAT_SENSE         34    ///< GPIO34 (ADC1_CH6) voltage divider
+#define VBAT_DIVIDER_RATIO     2.0f  ///< R1=100k, R2=100k resistor divider
+#define VBAT_MIN_VALID         2.80f ///< Minimum valid battery voltage (filters floating pin on USB)
+#define VBAT_LOW_THRESHOLD     3.40f ///< Low battery cut-off warning (V)
+
+// --- Mini RGB LED (KY-016 / SMD 0805) ---
+// NOTE: GPIO 25 (DAC1/ADC2/RTC) conflicts with ESP32 BLE stack when BLE is active.
+// GPIO 32 (ADC1_CH4) is BLE-safe and does not share RTC/DAC functions.
+#define RGB_LED_PIN_RED      32     ///< GPIO 32 (ADC1 - BLE-safe) connected to Red channel
+#define RGB_LED_PIN_GREEN    26     ///< GPIO 26 connected to Green channel
+#define RGB_LED_PIN_BLUE     27     ///< GPIO 27 connected to Blue channel
+
+/**
+ * Hardware Polarity:
+ * 1 = Common Cathode (Active HIGH: duty = val, pin HIGH = ON) - e.g. KY-016
+ * 0 = Common Anode   (Active LOW : duty = 255 - val, pin LOW = ON)
+ */
+#define RGB_LED_COMMON_CATHODE 1
+
+#define RGB_LED_MAX_BRIGHTNESS  255   ///< Full 100% duty cycle (255) for clear visibility
+
+// =============================================================================
+// HAV FSM STATE ENUMERATION
+// =============================================================================
+typedef enum {
+    HAV_STATE_INIT = 0,            ///< Power-on / booting
+    HAV_STATE_BLE_ADVERTISING,     ///< BLE advertising (waiting for Main Unit)
+    HAV_STATE_LOGGING_NORMAL,      ///< Connected, active logging
+    HAV_STATE_COMM_LOST,           ///< BLE disconnected during session
+    HAV_STATE_ERROR,               ///< Sensor or hardware fault
+    HAV_STATE_LOW_BATTERY          ///< Battery critical (V_bat < 3.4V)
+} hav_fsm_state_t;
+
+// Shorthand aliases
+#define STATE_INIT                 HAV_STATE_INIT
+#define STATE_BLE_ADVERTISING      HAV_STATE_BLE_ADVERTISING
+#define STATE_LOGGING_NORMAL       HAV_STATE_LOGGING_NORMAL
+#define STATE_COMM_LOST            HAV_STATE_COMM_LOST
+#define STATE_ERROR                HAV_STATE_ERROR
+#define STATE_LOW_BATTERY          HAV_STATE_LOW_BATTERY
 
 // =============================================================================
 // ADXL345 REGISTER MAP & CONFIG
@@ -388,6 +436,174 @@ bool readADXL345(float &ax, float &ay, float &az) {
 }
 
 // =============================================================================
+// MINI RGB LED SUBSYSTEM (LEDC PWM & FREERTOS BACKGROUND TASK)
+// =============================================================================
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+} rgb_color_t;
+
+static const rgb_color_t COLOR_OFF    = {0,   0,   0};
+static const rgb_color_t COLOR_RED    = {255, 0,   0};
+static const rgb_color_t COLOR_GREEN  = {0,   255, 0};
+static const rgb_color_t COLOR_BLUE   = {0,   0,   255};
+
+static volatile hav_fsm_state_t s_current_led_state = HAV_STATE_INIT;
+static SemaphoreHandle_t        s_mutex_led         = nullptr;
+static TaskHandle_t             s_task_led_handle   = nullptr;
+static bool                     s_led_initialized   = false;
+
+static inline uint32_t scale_led_duty(uint8_t val) {
+    uint32_t scaled = ((uint32_t)val * (uint32_t)RGB_LED_MAX_BRIGHTNESS) / 255U;
+#if RGB_LED_COMMON_CATHODE
+    return scaled;
+#else
+    return 255U - scaled;
+#endif
+}
+
+static void apply_hw_color(uint8_t r, uint8_t g, uint8_t b) {
+    analogWrite(RGB_LED_PIN_RED,   scale_led_duty(r));
+    analogWrite(RGB_LED_PIN_GREEN, scale_led_duty(g));
+    analogWrite(RGB_LED_PIN_BLUE,  scale_led_duty(b));
+}
+
+static void vTaskRgbLedPattern(void *pvParameters) {
+    TickType_t xLastWakeTime = xTaskGetTickCount();
+    const TickType_t xPeriod = pdMS_TO_TICKS(20); // 50 Hz update rate
+    uint32_t tickCount = 0;
+
+    while (true) {
+        vTaskDelayUntil(&xLastWakeTime, xPeriod);
+        tickCount++;
+
+        hav_fsm_state_t state = HAV_STATE_INIT;
+        if (s_mutex_led && xSemaphoreTake(s_mutex_led, pdMS_TO_TICKS(5)) == pdTRUE) {
+            state = s_current_led_state;
+            xSemaphoreGive(s_mutex_led);
+        } else {
+            state = s_current_led_state;
+        }
+
+        switch (state) {
+            case HAV_STATE_INIT:
+            case HAV_STATE_BLE_ADVERTISING: {
+                // Blue color, slow blink (1 Hz, 50% duty: 500 ms ON, 500 ms OFF)
+                const uint32_t phase = tickCount % 50;
+                if (phase < 25) apply_hw_color(COLOR_BLUE.r, COLOR_BLUE.g, COLOR_BLUE.b);
+                else            apply_hw_color(COLOR_OFF.r, COLOR_OFF.g, COLOR_OFF.b);
+                break;
+            }
+
+            case HAV_STATE_LOGGING_NORMAL: {
+                // Skenario B: Green color, smooth breathing over 2.0 seconds
+                const uint32_t phase = tickCount % 100;
+                const float rad = (float)phase * (2.0f * (float)M_PI / 100.0f);
+                const float normalized = (1.0f - cosf(rad)) * 0.5f;
+                const uint8_t green_val = (uint8_t)(35.0f + normalized * (255.0f - 35.0f));
+                apply_hw_color(0, green_val, 0);
+                break;
+            }
+
+            case HAV_STATE_COMM_LOST:
+            case HAV_STATE_ERROR: {
+                // Skenario D & E: Red color, alternating blink at 2 Hz (250 ms ON, 250 ms OFF)
+                const uint32_t phase = tickCount % 25;
+                if (phase < 13) apply_hw_color(COLOR_RED.r, COLOR_RED.g, COLOR_RED.b);
+                else            apply_hw_color(COLOR_OFF.r, COLOR_OFF.g, COLOR_OFF.b);
+                break;
+            }
+
+            case HAV_STATE_LOW_BATTERY: {
+                // Double-blink RED every 3 seconds
+                const uint32_t phase = tickCount % 150;
+                if (phase < 5 || (phase >= 10 && phase < 15)) {
+                    apply_hw_color(COLOR_RED.r, COLOR_RED.g, COLOR_RED.b);
+                } else {
+                    apply_hw_color(COLOR_OFF.r, COLOR_OFF.g, COLOR_OFF.b);
+                }
+                break;
+            }
+
+            default:
+                apply_hw_color(COLOR_OFF.r, COLOR_OFF.g, COLOR_OFF.b);
+                break;
+        }
+    }
+}
+
+esp_err_t rgb_led_init(void) {
+    if (s_led_initialized) return ESP_OK;
+
+    if (!s_mutex_led) {
+        s_mutex_led = xSemaphoreCreateMutex();
+        if (!s_mutex_led) return ESP_ERR_NO_MEM;
+    }
+
+    pinMode(RGB_LED_PIN_RED,   OUTPUT);
+    pinMode(RGB_LED_PIN_GREEN, OUTPUT);
+    pinMode(RGB_LED_PIN_BLUE,  OUTPUT);
+
+    // Initial state: OFF (100% non-blocking, zero delay)
+    apply_hw_color(0, 0, 0);
+
+    BaseType_t res = xTaskCreatePinnedToCore(
+        vTaskRgbLedPattern, "RGB_LED_FSM",
+        4096, nullptr, 1, &s_task_led_handle, 1
+    );
+
+    if (res != pdPASS) return ESP_FAIL;
+
+    s_led_initialized = true;
+    s_current_led_state = HAV_STATE_BLE_ADVERTISING;
+    return ESP_OK;
+}
+
+void rgb_led_set_state(hav_fsm_state_t new_state) {
+    if (!s_led_initialized && rgb_led_init() != ESP_OK) return;
+
+    if (s_mutex_led && xSemaphoreTake(s_mutex_led, pdMS_TO_TICKS(10)) == pdTRUE) {
+        if (s_current_led_state != new_state) {
+            const char *state_str = "UNKNOWN";
+            switch (new_state) {
+                case HAV_STATE_INIT:            state_str = "INIT (Blue 1Hz)"; break;
+                case HAV_STATE_BLE_ADVERTISING: state_str = "BLE_ADVERTISING (Blue 1Hz)"; break;
+                case HAV_STATE_LOGGING_NORMAL:  state_str = "LOGGING_NORMAL (Green Breathe)"; break;
+                case HAV_STATE_COMM_LOST:       state_str = "COMM_LOST (Red 2Hz)"; break;
+                case HAV_STATE_ERROR:           state_str = "ERROR (Red 2Hz)"; break;
+                case HAV_STATE_LOW_BATTERY:     state_str = "LOW_BATTERY (Red Double-Blink)"; break;
+            }
+            LOG_I("LED", "FSM State transition: -> %s", state_str);
+            s_current_led_state = new_state;
+        }
+        xSemaphoreGive(s_mutex_led);
+    } else {
+        s_current_led_state = new_state;
+    }
+}
+
+hav_fsm_state_t rgb_led_get_state(void) {
+    hav_fsm_state_t st = HAV_STATE_INIT;
+    if (s_mutex_led && xSemaphoreTake(s_mutex_led, pdMS_TO_TICKS(5)) == pdTRUE) {
+        st = s_current_led_state;
+        xSemaphoreGive(s_mutex_led);
+    } else {
+        st = s_current_led_state;
+    }
+    return st;
+}
+
+
+void rgb_led_set_color(uint8_t r, uint8_t g, uint8_t b) {
+    apply_hw_color(r, g, b);
+}
+
+void rgb_led_off(void) {
+    apply_hw_color(COLOR_OFF.r, COLOR_OFF.g, COLOR_OFF.b);
+}
+
+// =============================================================================
 // BLE SERVER CALLBACKS
 // =============================================================================
 /**
@@ -398,16 +614,28 @@ class HavBleServerCallbacks : public BLEServerCallbacks {
     /** @brief Triggered when a BLE Client connects. */
     void onConnect(BLEServer *server) override {
         bleClientConnected = true;
-        LOG_I("BLE", "BLE client connected.");
+        LOG_I("BLE", "BLE client connected. Transitioning LED to LOGGING_NORMAL.");
+        rgb_led_set_state(STATE_LOGGING_NORMAL);
     }
 
     /** @brief Triggered when a BLE Client disconnects; restarts advertising. */
     void onDisconnect(BLEServer *server) override {
         bleClientConnected = false;
-        LOG_W("BLE", "BLE client disconnected. Restarting advertising...");
+        LOG_W("BLE", "BLE client disconnected. Transitioning LED to COMM_LOST & restarting advertising...");
+        rgb_led_set_state(STATE_COMM_LOST);
         server->getAdvertising()->start();
     }
 };
+
+/**
+ * @brief Sample battery voltage through resistive divider on ADC1.
+ * @return Battery voltage in Volts.
+ */
+static float readBatteryVoltage() {
+    const uint16_t raw = analogRead(PIN_VBAT_SENSE);
+    const float pinVoltage = (raw / 4095.0f) * 3.3f;
+    return pinVoltage * VBAT_DIVIDER_RATIO;
+}
 
 // =============================================================================
 // BLE SETUP
@@ -512,6 +740,15 @@ void setup() {
     Serial.println("  Design Configuration: No RTC, no SD, no OLED             ");
     Serial.println("==========================================================");
 
+    // Initialize Mini RGB LED module (KY-016 / SMD 0805)
+    if (rgb_led_init() == ESP_OK) {
+        LOG_I("INIT", "Mini RGB LED initialized on GPIO R:%d G:%d B:%d",
+              RGB_LED_PIN_RED, RGB_LED_PIN_GREEN, RGB_LED_PIN_BLUE);
+        rgb_led_set_state(STATE_INIT);
+    } else {
+        LOG_E("INIT", "Mini RGB LED initialization failed!");
+    }
+
 #if SIMULATE_ADXL345
     adxlAvailable = true;
     LOG_I("INIT", "ADXL345 HAV is SIMULATED");
@@ -521,6 +758,7 @@ void setup() {
 
     if (!adxlAvailable) {
         LOG_E("INIT", "ADXL345 HAV sensor initialization FAILED.");
+        rgb_led_set_state(STATE_ERROR);
         LOG_W("INIT", "Check wiring connections:");
         LOG_W("INIT", "  - VCC -> 3V3");
         LOG_W("INIT", "  - GND -> GND");
@@ -528,6 +766,8 @@ void setup() {
         LOG_W("INIT", "  - SCL -> GPIO22");
         LOG_W("INIT", "  - CS  -> 3V3");
         LOG_W("INIT", "  - SDO -> GND (for 0x53) or 3V3 (for 0x1D)");
+    } else {
+        rgb_led_set_state(STATE_BLE_ADVERTISING);
     }
 
     setupBLE();
@@ -578,11 +818,16 @@ void loop() {
             if (nowMs - lastErrorPrintMs >= 1000) {
                 lastErrorPrintMs = nowMs;
                 LOG_E("SENSOR", "ADXL345 HAV read failed! Retrying initialization...");
+                rgb_led_set_state(STATE_ERROR);
 
                 // Attempt hardware sensor recovery
                 Wire.setClock(100000);
                 adxlAvailable = setupADXL345();
                 Wire.setClock(400000);
+
+                if (adxlAvailable) {
+                    rgb_led_set_state(bleClientConnected ? STATE_LOGGING_NORMAL : STATE_BLE_ADVERTISING);
+                }
             }
             return;
         }
@@ -616,6 +861,21 @@ void loop() {
             Serial.printf("RAW: ax=%.6f, ay=%.6f, az=%.6f | ", lastRawX, lastRawY, lastRawZ);
 
             sendHavBlePacket(ahwx, ahwy, ahwz, ahv, sampleCount);
+
+
+#if ENABLE_BATTERY_MONITOR
+            // ── Periodic battery voltage monitoring (every 5 seconds) ─────────
+            static uint32_t lastBatteryCheckMs = 0;
+            const uint32_t nowMs = millis();
+            if (nowMs - lastBatteryCheckMs >= 5000) {
+                lastBatteryCheckMs = nowMs;
+                const float vbat = readBatteryVoltage();
+                if (vbat >= VBAT_MIN_VALID && vbat < VBAT_LOW_THRESHOLD) {
+                    LOG_W("PWR", "Low battery detected: %.2f V < %.2f V", vbat, VBAT_LOW_THRESHOLD);
+                    rgb_led_set_state(STATE_LOW_BATTERY);
+                }
+            }
+#endif
 
             // Reset accumulators
             sumX2 = 0.0f;
