@@ -61,6 +61,7 @@
 #include <RTClib.h>             // Adafruit RTClib for DS3231
 #include <SD.h>                 // Arduino SD library
 #include <Adafruit_SH110X.h>    // Official Adafruit SH110X OLED driver (for SH1106 1.3")
+#include <TinyGPS++.h>          // NMEA GPS parser for u-blox NEO-6M
 
 // =============================================================================
 // DEBUG & BLE CONFIGURATION
@@ -95,6 +96,11 @@
 // --- HMI ---
 #define PIN_BUTTON            4   // Tactile push-button (active-low, internal pull-up)
 #define PIN_LED_STATUS        2   // On-board LED for status indication
+
+// --- GPS Module (u-blox NEO-6M via UART2) ---
+#define PIN_GPS_RX           16   // ESP32 RX2 connected to GPS TX
+#define PIN_GPS_TX           17   // ESP32 TX2 connected to GPS RX
+#define GPS_BAUD_RATE        9600
 
 // --- ADXL345 I2C Addresses (WBV only) ---
 #define ADXL345_ADDR_WBV     0x1D   // WBV sensor (SDO tied to 3V3)
@@ -158,14 +164,16 @@
 #define TASK_STACK_BLE       8192U   // BLE stack needs extra heap
 #define TASK_STACK_LOGGER    8192U   // Larger — handles file I/O
 #define TASK_STACK_HMI       4096U
+#define TASK_STACK_GPS       3072U   // GPS parser task
 
 #define TASK_PRIO_WBV        4
 #define TASK_PRIO_BLE        3       // BLE Receiver (event-driven, Core 1)
 #define TASK_PRIO_LOGGER     2
 #define TASK_PRIO_HMI        1
+#define TASK_PRIO_GPS        1       // GPS parsing (background stream on Core 1)
 
 #define CORE_DSP             0       // PRO_CPU — WBV Acquisition & DSP
-#define CORE_PERIPHERAL      1       // APP_CPU — BLE, Logging & HMI
+#define CORE_PERIPHERAL      1       // APP_CPU — BLE, Logging, HMI & GPS
 
 #define QUEUE_HAV_LENGTH     8U      // Buffer up to 8 BLE-received HAV epochs
 #define QUEUE_WBV_LENGTH     8U
@@ -202,6 +210,21 @@ typedef struct {
     uint32_t n_samples;   ///< Actual samples accumulated in this epoch
 } WbvRmsData_t;
 
+/**
+ * @struct GpsData
+ * @brief  Snapshot of latest GPS navigation and quality metrics from u-blox NEO-6M.
+ */
+typedef struct {
+    double   latitude;    ///< Latitude in degrees (e.g. -6.891234)
+    double   longitude;   ///< Longitude in degrees (e.g. 107.610123)
+    float    speedKmh;    ///< Ground speed [km/h]
+    int32_t  altitudeMM;  ///< Altitude above mean sea level [millimeters]
+    float    hdop;        ///< Horizontal Dilution of Precision
+    uint32_t satellites;  ///< Number of satellites in view
+    uint32_t ageMs;       ///< Time since last position update [ms]
+    bool     fixValid;    ///< True if valid location fix acquired
+} GpsData_t;
+
 // =============================================================================
 // SYSTEM FSM
 // =============================================================================
@@ -222,6 +245,7 @@ static TaskHandle_t  hTaskBLE     = nullptr;   // BLE Receiver (replaces local H
 static TaskHandle_t  hTaskWBV     = nullptr;
 static TaskHandle_t  hTaskLogger  = nullptr;
 static TaskHandle_t  hTaskHMI     = nullptr;
+static TaskHandle_t  hTaskGPS     = nullptr;
 
 // Queue handles — inter-core data passing (preferred over mutexes for producers→consumers)
 static QueueHandle_t xQueueHAVData = nullptr;
@@ -236,17 +260,26 @@ static SemaphoreHandle_t xMutexSD   = nullptr;
 // Mutex protecting the systemState variable (written by HMI, read by all tasks)
 static SemaphoreHandle_t xMutexState = nullptr;
 
+// Mutex protecting shared latestGpsData snapshot
+static SemaphoreHandle_t xMutexGPS   = nullptr;
+
 // =============================================================================
 // GLOBAL SHARED STATE (mutex-protected where applicable)
 // =============================================================================
 static volatile SystemState_t systemState = SYS_INIT;
 
 // Sensor/peripheral availability flags
-static bool wbvSensorOK  = false;
+static bool wbvSensorOK   = false;
 static uint8_t actual_wbv_addr = 0x00;
-static bool rtcOK        = false;
-static bool sdOK         = false;
-static bool oledOK       = false;
+static bool rtcOK         = false;
+static bool sdOK          = false;
+static bool oledOK        = false;
+static bool gpsHardwareOK = false;
+
+// GPS hardware & shared data objects
+static HardwareSerial gpsSerial(2);
+static TinyGPSPlus    gps;
+static GpsData_t      latestGpsData = {0.0, 0.0, 0.0f, 0, 99.99f, 0, 0xFFFFFFFFUL, false};
 
 // BLE connection status (volatile: written by BLE callback on Core 1, read by HMI)
 static volatile bool bleConnected   = false;   // true = HAV Node BLE link is up
@@ -778,9 +811,61 @@ static void vTaskWBVAcquisition(void *pvParameters) {
 }
 
 // =============================================================================
-// TASK: vTaskDataLogger
-// Core 1 | Priority 3 | Interval 1000 ms
+// TASK: vTaskGPS
+// Core 1 | Priority 1 | Period 50 ms
 // =============================================================================
+/**
+ * @brief  GPS acquisition & NMEA parsing task — Core 1, Priority 1.
+ *         Continuously reads incoming characters from UART2 hardware FIFO,
+ *         feeds TinyGPS++ parser, and publishes thread-safe GpsData_t snapshot.
+ */
+static void vTaskGPS(void *pvParameters) {
+    static const char *TAG = "GPS";
+    LOG_I(TAG, "GPS task started on Core %d", xPortGetCoreID());
+
+    uint32_t lastNmeaTimeMs = gpsHardwareOK ? millis() : 0;
+
+    while (true) {
+        bool receivedAnyNmea = false;
+
+        // Read all available bytes from UART2 FIFO
+        while (gpsSerial.available() > 0) {
+            char c = (char)gpsSerial.read();
+            // Validate printable ASCII / valid NMEA framing ($GPRMC, $GPGGA)
+            if (c == '$' || (c >= 32 && c <= 126) || c == '\r' || c == '\n') {
+                if (gps.encode(c) || c == '$') {
+                    receivedAnyNmea = true;
+                }
+            }
+        }
+
+        const uint32_t now = millis();
+        if (receivedAnyNmea) {
+            lastNmeaTimeMs = now;
+            gpsHardwareOK = true;
+        } else if (now - lastNmeaTimeMs > 3000UL) {
+            // No valid NMEA data for 3 seconds -> Hardware disconnected or lost power
+            gpsHardwareOK = false;
+        }
+
+        // Update latestGpsData snapshot under mutex
+        if (xSemaphoreTake(xMutexGPS, pdMS_TO_TICKS(20)) == pdTRUE) {
+            const bool hasValidFix = (gpsHardwareOK && gps.location.isValid() && gps.location.age() < 2000UL);
+            latestGpsData.fixValid   = hasValidFix;
+            latestGpsData.latitude   = hasValidFix ? gps.location.lat() : 0.0;
+            latestGpsData.longitude  = hasValidFix ? gps.location.lng() : 0.0;
+            latestGpsData.speedKmh   = (hasValidFix && gps.speed.isValid() && gps.speed.age() < 2000UL) ? (float)gps.speed.kmph() : 0.0f;
+            latestGpsData.altitudeMM = (hasValidFix && gps.altitude.isValid() && gps.altitude.age() < 2000UL) ? (int32_t)(gps.altitude.meters() * 1000.0f) : 0;
+            latestGpsData.hdop       = (gpsHardwareOK && gps.hdop.isValid()) ? (float)gps.hdop.hdop() : 99.99f;
+            latestGpsData.satellites = (gpsHardwareOK && gps.satellites.isValid()) ? (uint32_t)gps.satellites.value() : 0;
+            latestGpsData.ageMs      = (gpsHardwareOK && gps.location.isValid()) ? (uint32_t)gps.location.age() : 0xFFFFFFFFUL;
+            xSemaphoreGive(xMutexGPS);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 // =============================================================================
 // SD CARD RE-INITIALISATION HELPER
 // =============================================================================
@@ -796,10 +881,20 @@ static bool sd_reinit(void) {
             sdOK = SD.begin(PIN_SD_CS, SPI, 1000000);
         }
         if (sdOK) {
-            if (!SD.exists("/dosimeter.csv")) {
-                File f = SD.open("/dosimeter.csv", FILE_WRITE);
+            const char *csvPath = "/dosimeter.csv";
+            const char *headerStr = "timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av,lat,lon,speed_kmh,altitudeMM,hdop,satellites,ageMs,fix_valid";
+            bool needHeader = !SD.exists(csvPath);
+            if (!needHeader) {
+                File checkF = SD.open(csvPath, FILE_READ);
+                if (checkF) {
+                    if (checkF.size() == 0) needHeader = true;
+                    checkF.close();
+                }
+            }
+            if (needHeader) {
+                File f = SD.open(csvPath, FILE_WRITE);
                 if (f) {
-                    f.println("timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av");
+                    f.println(headerStr);
                     f.close();
                 }
             }
@@ -842,10 +937,20 @@ static void vTaskDataLogger(void *pvParameters) {
     // ── SD Card Initialisation ────────────────────────────────────────────────
     if (sdOK) {
         if (xSemaphoreTake(xMutexSD, pdMS_TO_TICKS(50)) == pdTRUE) {
-            if (!SD.exists("/dosimeter.csv")) {
-                File f = SD.open("/dosimeter.csv", FILE_WRITE);
+            const char *csvPath = "/dosimeter.csv";
+            const char *headerStr = "timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av,lat,lon,speed_kmh,altitudeMM,hdop,satellites,ageMs,fix_valid";
+            bool needHeader = !SD.exists(csvPath);
+            if (!needHeader) {
+                File checkF = SD.open(csvPath, FILE_READ);
+                if (checkF) {
+                    if (checkF.size() == 0) needHeader = true;
+                    checkF.close();
+                }
+            }
+            if (needHeader) {
+                File f = SD.open(csvPath, FILE_WRITE);
                 if (f) {
-                    f.println("timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av");
+                    f.println(headerStr);
                     f.close();
                 }
             }
@@ -880,16 +985,52 @@ static void vTaskDataLogger(void *pvParameters) {
             char timeStr[32];
             rtc_getFormattedTime(timeStr, sizeof(timeStr));
 
+            // Snapshot latest GPS data under mutex
+            GpsData_t gpsSnap;
+            if (xSemaphoreTake(xMutexGPS, pdMS_TO_TICKS(20)) == pdTRUE) {
+                gpsSnap = latestGpsData;
+                xSemaphoreGive(xMutexGPS);
+            } else {
+                gpsSnap.latitude   = 0.0;
+                gpsSnap.longitude  = 0.0;
+                gpsSnap.speedKmh   = 0.0f;
+                gpsSnap.altitudeMM = 0;
+                gpsSnap.hdop       = 99.99f;
+                gpsSnap.satellites = 0;
+                gpsSnap.ageMs      = 0xFFFFFFFFUL;
+                gpsSnap.fixValid   = false;
+            }
+
             if (sdOK) {
                 // Take mutex to guard SPI bus if other tasks use SPI
                 if (xSemaphoreTake(xMutexSD, pdMS_TO_TICKS(50)) == pdTRUE) {
-                    File f = SD.open("/dosimeter.csv", FILE_APPEND);
+                    const char *csvPath = "/dosimeter.csv";
+                    const char *headerStr = "timestamp,ahwx,ahwy,ahwz,ahv,awx,awy,awz,av,lat,lon,speed_kmh,altitudeMM,hdop,satellites,ageMs,fix_valid";
+
+                    // Ensure CSV header exists if file was newly created or empty
+                    bool needHeader = !SD.exists(csvPath);
+                    if (!needHeader) {
+                        File checkF = SD.open(csvPath, FILE_READ);
+                        if (checkF) {
+                            if (checkF.size() == 0) needHeader = true;
+                            checkF.close();
+                        }
+                    }
+                    if (needHeader) {
+                        File fH = SD.open(csvPath, FILE_WRITE);
+                        if (fH) {
+                            fH.println(headerStr);
+                            fH.close();
+                        }
+                    }
+
+                    File f = SD.open(csvPath, FILE_APPEND);
                     if (f) {
                         sdFailCount = 0; // Reset fail count on success
-                        // Compose CSV line
-                        char line[160];
+                        // Compose CSV line with ISO vibration + geospatial metrics
+                        char line[256];
                         snprintf(line, sizeof(line),
-                                 "%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f",
+                                 "%s,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.6f,%.6f,%.2f,%ld,%.2f,%lu,%lu,%d",
                                  timeStr,
                                  havReceived ? havData.ahwx : 0.0f,
                                  havReceived ? havData.ahwy : 0.0f,
@@ -898,7 +1039,15 @@ static void vTaskDataLogger(void *pvParameters) {
                                  wbvReceived ? wbvData.awx  : 0.0f,
                                  wbvReceived ? wbvData.awy  : 0.0f,
                                  wbvReceived ? wbvData.awz  : 0.0f,
-                                 wbvReceived ? wbvData.av   : 0.0f);
+                                 wbvReceived ? wbvData.av   : 0.0f,
+                                 gpsSnap.latitude,
+                                 gpsSnap.longitude,
+                                 gpsSnap.speedKmh,
+                                 (long)gpsSnap.altitudeMM,
+                                 gpsSnap.hdop,
+                                 (unsigned long)gpsSnap.satellites,
+                                 (unsigned long)gpsSnap.ageMs,
+                                 gpsSnap.fixValid ? 1 : 0);
                         f.println(line);
                         f.close();  // Fail-safe flush on every write
                     } else { 
@@ -915,16 +1064,15 @@ static void vTaskDataLogger(void *pvParameters) {
                 }
             }
 
-            LOG_I(TAG, "LOGGER t=%s | HAV ahv=%.4f (x=%.4f y=%.4f z=%.4f) | WBV av=%.4f (x=%.4f y=%.4f z=%.4f)",
+            LOG_I(TAG, "LOGGER t=%s | HAV ahv=%.4f | WBV av=%.4f | GPS fix=%d sat=%lu spd=%.1f km/h alt=%.1f m hdop=%.2f",
                   timeStr,
                   havReceived ? havData.ahv  : 0.0f,
-                  havReceived ? havData.ahwx : 0.0f,
-                  havReceived ? havData.ahwy : 0.0f,
-                  havReceived ? havData.ahwz : 0.0f,
                   wbvReceived ? wbvData.av   : 0.0f,
-                  wbvReceived ? wbvData.awx  : 0.0f,
-                  wbvReceived ? wbvData.awy  : 0.0f,
-                  wbvReceived ? wbvData.awz  : 0.0f);
+                  gpsSnap.fixValid ? 1 : 0,
+                  (unsigned long)gpsSnap.satellites,
+                  gpsSnap.speedKmh,
+                  gpsSnap.altitudeMM / 1000.0f,
+                  gpsSnap.hdop);
         }
     }
 }
@@ -1135,6 +1283,23 @@ static void vTaskHMIAndController(void *pvParameters) {
                     oled.println(sdOK ? "OK" : "ERR");
                     oled.print("RTC:     ");
                     oled.println(rtcOK ? "OK" : "ERR");
+                    oled.print("GPS:     ");
+                    if (!gpsHardwareOK) {
+                        oled.println("ERR");
+                    } else {
+                        GpsData_t gSnap;
+                        bool gotSnap = false;
+                        if (xSemaphoreTake(xMutexGPS, 0) == pdTRUE) {
+                            gSnap = latestGpsData;
+                            gotSnap = true;
+                            xSemaphoreGive(xMutexGPS);
+                        }
+                        if (gotSnap && gSnap.fixValid) {
+                            oled.printf("OK (%lus)\n", (unsigned long)gSnap.satellites);
+                        } else {
+                            oled.println("NO FIX");
+                        }
+                    }
 
                     oled.display();
                 }
@@ -1223,8 +1388,32 @@ static void runSelfTest() {
     // After detection, raise I2C clock for normal operation
     Wire.setClock(400000);
 
-    LOG_I("INIT", "Self-test complete: WBV=%d RTC=%d SD=%d OLED=%d",
-          wbvSensorOK, rtcOK, sdOK, oledOK);
+    // GPS u-blox NEO-6M UART2 Probe
+    // Enable internal pull-up on RX pin to prevent floating noise when disconnected
+    pinMode(PIN_GPS_RX, INPUT_PULLUP);
+    gpsSerial.begin(GPS_BAUD_RATE, SERIAL_8N1, PIN_GPS_RX, PIN_GPS_TX);
+    
+    // Flush any stale buffer
+    while (gpsSerial.available()) gpsSerial.read();
+
+    // Probe for actual NMEA framing characters ($) within 1500 ms window
+    uint32_t gpsProbeStart = millis();
+    bool gpsGotNmea = false;
+    while (millis() - gpsProbeStart < 1500UL) {
+        while (gpsSerial.available() > 0) {
+            char c = (char)gpsSerial.read();
+            if (c == '$' || gps.encode(c)) {
+                gpsGotNmea = true;
+            }
+        }
+        if (gpsGotNmea) break;
+        delay(10);
+    }
+    gpsHardwareOK = gpsGotNmea;
+    LOG_I("INIT", "GPS u-blox NEO-6M UART2 probe: %s", gpsHardwareOK ? "OK (NMEA stream live)" : "NO RESPONSE / DISCONNECTED");
+
+    LOG_I("INIT", "Self-test complete: WBV=%d RTC=%d SD=%d OLED=%d GPS=%d",
+          wbvSensorOK, rtcOK, sdOK, oledOK, gpsHardwareOK);
 }
 
 // =============================================================================
@@ -1241,9 +1430,11 @@ static void createRTOSObjects() {
     xMutexRTC   = xSemaphoreCreateMutex();
     xMutexSD    = xSemaphoreCreateMutex();
     xMutexState = xSemaphoreCreateMutex();
+    xMutexGPS   = xSemaphoreCreateMutex();
     configASSERT(xMutexRTC   != nullptr);
     configASSERT(xMutexSD    != nullptr);
     configASSERT(xMutexState != nullptr);
+    configASSERT(xMutexGPS   != nullptr);
 }
 
 // =============================================================================
@@ -1260,7 +1451,7 @@ static void createTasks() {
         CORE_DSP);
     configASSERT(res == pdPASS);
 
-    // ── Core 1: BLE Receiver, Logger, HMI ────────────────────────────────────
+    // ── Core 1: BLE Receiver, Logger, HMI, GPS ───────────────────────────────
 #if USE_BLE_HAV
     res = xTaskCreatePinnedToCore(
         vTaskBLEReceiver, "BLE_RX",
@@ -1269,6 +1460,13 @@ static void createTasks() {
         CORE_PERIPHERAL);
     configASSERT(res == pdPASS);
 #endif
+
+    res = xTaskCreatePinnedToCore(
+        vTaskGPS, "GPS_ACQ",
+        TASK_STACK_GPS, nullptr,
+        TASK_PRIO_GPS, &hTaskGPS,
+        CORE_PERIPHERAL);
+    configASSERT(res == pdPASS);
 
     res = xTaskCreatePinnedToCore(
         vTaskDataLogger, "LOGGER",

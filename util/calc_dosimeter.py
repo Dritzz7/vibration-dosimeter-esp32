@@ -94,11 +94,27 @@ def parse_dosimeter_csv(file_path):
                 awz  = float(row[7])
                 av   = float(row[8])
 
-                records.append({
+                rec = {
                     'timestamp': ts_str,
                     'ahwx': ahwx, 'ahwy': ahwy, 'ahwz': ahwz, 'ahv': ahv,
                     'awx': awx,  'awy': awy,  'awz': awz,  'av': av
-                })
+                }
+
+                # Optional GPS columns (lat, lon, speed_kmh, altitudeMM, hdop, satellites, ageMs, fix_valid)
+                if len(row) >= 17:
+                    try:
+                        rec['lat'] = float(row[9])
+                        rec['lon'] = float(row[10])
+                        rec['speed_kmh'] = float(row[11])
+                        rec['altitudeMM'] = int(row[12])
+                        rec['hdop'] = float(row[13])
+                        rec['satellites'] = int(row[14])
+                        rec['ageMs'] = int(row[15])
+                        rec['fix_valid'] = int(row[16]) == 1
+                    except (ValueError, IndexError):
+                        pass
+
+                records.append(rec)
             except ValueError:
                 # Skip unparseable rows
                 continue
@@ -197,7 +213,7 @@ def calculate_metrics(records):
     t_eav_wbv_sec = T_8H_SEC * ((WBV_EAV_A8 / max_weighted_rms) ** 2) if max_weighted_rms > 0 else float('inf')
     t_elv_wbv_sec = T_8H_SEC * ((WBV_ELV_A8 / max_weighted_rms) ** 2) if max_weighted_rms > 0 else float('inf')
 
-    return {
+    m = {
         'N': N,
         'T_total_sec': T_total_sec,
         # HAV
@@ -212,6 +228,28 @@ def calculate_metrics(records):
         'vdv_x': vdv_x, 'vdv_y': vdv_y, 'vdv_z': vdv_z, 'vdv_total': vdv_total, 'evdv': evdv,
         't_eav_wbv_sec': t_eav_wbv_sec, 't_elv_wbv_sec': t_elv_wbv_sec
     }
+
+    # GPS Metrics calculation
+    gps_valid = [r for r in records if r.get('fix_valid', False)]
+    if gps_valid:
+        speeds = [r['speed_kmh'] for r in gps_valid]
+        alts = [r['altitudeMM'] / 1000.0 for r in gps_valid]
+        hdops = [r['hdop'] for r in gps_valid]
+        sats = [r['satellites'] for r in gps_valid]
+        m['has_gps'] = True
+        m['gps_fix_count'] = len(gps_valid)
+        m['gps_fix_pct'] = (len(gps_valid) / N) * 100.0
+        m['speed_max'] = max(speeds) if speeds else 0.0
+        m['speed_avg'] = sum(speeds) / len(speeds) if speeds else 0.0
+        m['alt_avg'] = sum(alts) / len(alts) if alts else 0.0
+        m['hdop_avg'] = sum(hdops) / len(hdops) if hdops else 99.99
+        m['sat_avg'] = sum(sats) / len(sats) if sats else 0
+        m['last_lat'] = gps_valid[-1]['lat']
+        m['last_lon'] = gps_valid[-1]['lon']
+    else:
+        m['has_gps'] = False
+
+    return m
 
 
 def format_duration(seconds):
@@ -288,6 +326,18 @@ def generate_report(file_path, m):
     lines.append(f"      A(8) ELV = {WBV_ELV_A8:.2f} m/s²  | Time allowed = {format_duration(m['t_elv_wbv_sec'])}")
     lines.append(f"      VDV  EAV = {WBV_EAV_VDV:.1f} m/s^1.75 | VDV ELV = {WBV_ELV_VDV:.1f} m/s^1.75")
     lines.append(f"  * Exposure Compliance Status: {wbv_status}")
+
+    # GPS SECTION (if present in log)
+    if m.get('has_gps', False):
+        lines.append("")
+        lines.append("3. GEOSPATIAL & VEHICLE TELEMETRY (u-blox NEO-6M GPS)")
+        lines.append("-------------------------------------------------------------------------------")
+        lines.append(f"  * Satellite Fix Coverage: {m['gps_fix_count']}/{m['N']} seconds ({m['gps_fix_pct']:.1f}% valid fix)")
+        lines.append(f"  * Vehicle Ground Speed  : Max = {m['speed_max']:.2f} km/h | Mean = {m['speed_avg']:.2f} km/h")
+        lines.append(f"  * Mean Altitude (MSL)   : {m['alt_avg']:.2f} meters")
+        lines.append(f"  * Signal Quality & Sats : Mean HDOP = {m['hdop_avg']:.2f} | Mean Satellites = {m['sat_avg']:.1f}")
+        lines.append(f"  * Latest Position Fix   : Lat = {m['last_lat']:.6f}, Lon = {m['last_lon']:.6f}")
+
     lines.append("===============================================================================")
 
     return "\n".join(lines)

@@ -53,7 +53,9 @@ Sistem dosimeter getaran terdiri dari dua unit terpisah yang berbasis mikrokontr
 | **6** | **GPIO 5** | `SD_CS` | Output Digital | Modul MicroSD (CS) | **PERINGATAN STRAPPING PIN**: GPIO 5 menentukan timing SDIO saat booting. **WAJIB pasang resistor pull-up eksternal $10\text{ k}\Omega$ ke `3V3`** agar tidak tertahan LOW saat boot. |
 | **7** | **GPIO 4** | `HMI_BUTTON` | Input Digital | Tombol Push-Button HMI | Rangkaian tombol aktif-rendah (*Active-Low*, tombol menghubungkan pin ke GND saat ditekan). Pasang resistor pull-up eksternal **$10\text{ k}\Omega$** ke `3V3`, kapasitor filter derau **$100\text{ nF}$** ke GND, dan dioda proteksi ESD (TVS). |
 | **8** | **GPIO 2** | `STATUS_LED` | Output Digital | Indikator LED Onboard | **STRAPPING PIN**: Harus berlogika LOW atau mengambang saat proses flashing UART. Pasang LED seri dengan resistor $330\ \Omega$ ke GND. |
-| **9** | **GPIO 35** *(Opsional)* | `VBAT_SENSE`| Input Analog (ADC1_CH7) | Rangkaian Pembagi Baterai | **Input-Only (GPI)**. Titik tengah pembagi tegangan 1:2 ($100\text{ k}\Omega + 100\text{ k}\Omega + 100\text{ nF}$) untuk pemantauan baterai Main Unit. |
+| **9** | **GPIO 16** | `GPS_RX2` | Input Digital (UART2_RXD) | Modul GPS u-blox NEO-6M (Pin TX) | Jalur data serial NMEA 9600 baud dari modul GPS ke ESP32. |
+| **10** | **GPIO 17** | `GPS_TX2` | Output Digital (UART2_TXD)| Modul GPS u-blox NEO-6M (Pin RX) | Jalur perintah konfigurasi serial dari ESP32 ke modul GPS. |
+| **11** | **GPIO 35** *(Opsional)* | `VBAT_SENSE`| Input Analog (ADC1_CH7) | Rangkaian Pembagi Baterai | **Input-Only (GPI)**. Titik tengah pembagi tegangan 1:2 ($100\text{ k}\Omega + 100\text{ k}\Omega + 100\text{ nF}$) untuk pemantauan baterai Main Unit. |
 
 > **📋 Alamat Bus I2C pada Main Unit:**
 > * **Sensor ADXL345 (WBV)**: Alamat **`0x53`** (SDO=GND) atau **`0x1D`** (SDO=3V3). Pin CS wajib ditarik ke `3V3`.
