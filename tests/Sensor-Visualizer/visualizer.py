@@ -49,7 +49,7 @@ def auto_detect_port():
 
 
 class VibrationVisualizer:
-    def __init__(self, port, baud=115200, buffer_size=800):
+    def __init__(self, port, baud=921600, buffer_size=1600):
         self.port_name = port
         self.baud_rate = baud
         self.buffer_size = buffer_size
@@ -112,45 +112,58 @@ class VibrationVisualizer:
                 if not line:
                     continue
 
-                # Print diagnostic or log messages directly
-                if line.startswith("#") or line.startswith("[") or line.startswith("="):
+                # Fast CSV Parser: ax,ay,az (e.g. "0.123,-0.456,9.807")
+                tokens = line.split(",")
+                has_sample = False
+                ax, ay, az = 0.0, 0.0, 0.0
+
+                if len(tokens) >= 3 and ":" not in tokens[0]:
+                    try:
+                        ax = float(tokens[0])
+                        ay = float(tokens[1])
+                        az = float(tokens[2])
+                        has_sample = True
+                    except ValueError:
+                        has_sample = False
+
+                # Fallback parser for labeled format: ax:X,ay:Y,az:Z
+                if not has_sample and "ax:" in line:
+                    data_map = {}
+                    for tok in line.replace(",", " ").split():
+                        if ":" in tok:
+                            k, v = tok.split(":", 1)
+                            try:
+                                data_map[k.strip()] = float(v.strip())
+                            except ValueError:
+                                pass
+                    if "ax" in data_map and "ay" in data_map and "az" in data_map:
+                        ax = data_map["ax"]
+                        ay = data_map["ay"]
+                        az = data_map["az"]
+                        has_sample = True
+
+                if not has_sample:
+                    # Print diagnostic, calibration certificate, or log messages directly
                     print(f"ESP32: {line}")
                     continue
 
-                # Parse: ax:%.3f,ay:%.3f,az:%.3f,amag:%.3f
-                # Also handles space or comma separation
-                tokens = line.replace(",", " ").split()
-                data_map = {}
-                for tok in tokens:
-                    if ":" in tok:
-                        k, v = tok.split(":", 1)
-                        try:
-                            data_map[k.strip()] = float(v.strip())
-                        except ValueError:
-                            pass
+                amag = np.sqrt(ax * ax + ay * ay + az * az)
+                now_t = time.time() - self.start_time
+                calc_samples += 1
 
-                if "ax" in data_map and "ay" in data_map and "az" in data_map:
-                    ax = data_map["ax"]
-                    ay = data_map["ay"]
-                    az = data_map["az"]
-                    amag = data_map.get("amag", np.sqrt(ax * ax + ay * ay + az * az))
+                # Measure actual frequency every 0.5s
+                dt = time.time() - last_calc_t
+                if dt >= 0.5:
+                    self.measured_fs = calc_samples / dt
+                    calc_samples = 0
+                    last_calc_t = time.time()
 
-                    now_t = time.time() - self.start_time
-                    calc_samples += 1
-
-                    # Measure actual frequency every 0.5s
-                    dt = time.time() - last_calc_t
-                    if dt >= 0.5:
-                        self.measured_fs = calc_samples / dt
-                        calc_samples = 0
-                        last_calc_t = time.time()
-
-                    with self.data_lock:
-                        self.t_buf.append(now_t)
-                        self.ax_buf.append(ax)
-                        self.ay_buf.append(ay)
-                        self.az_buf.append(az)
-                        self.am_buf.append(amag)
+                with self.data_lock:
+                    self.t_buf.append(now_t)
+                    self.ax_buf.append(ax)
+                    self.ay_buf.append(ay)
+                    self.az_buf.append(az)
+                    self.am_buf.append(amag)
 
             except Exception as e:
                 if self.running:
@@ -196,7 +209,7 @@ class VibrationVisualizer:
 
         # Instructions bar at the bottom
         fig.text(0.5, 0.01,
-                 "Hotkeys: [T] Tare Zero  |  [R] Reset Tare (1g)  |  [U] Toggle Units  |  [1-6] Switch ODR (100-3200Hz)  |  [Space] Pause",
+                 "Hotkeys: [C] Calibrate RION  |  [T] Tare Zero  |  [R] Reset Tare (1g)  |  [U] Units  |  [1-6] ODR (100-3200Hz)  |  [Space] Pause",
                  ha="center", fontsize=9, color="#8b949e")
 
         def update_frame(frame):
@@ -273,7 +286,7 @@ class VibrationVisualizer:
             if k == " ":
                 self.paused = not self.paused
                 print(f"[PLOT] {'PAUSED' if self.paused else 'RESUMED'}")
-            elif k in ["1", "2", "3", "4", "5", "6", "t", "r", "u", "p", "s", "h"]:
+            elif k in ["1", "2", "3", "4", "5", "6", "c", "t", "r", "u", "p", "s", "h"]:
                 self.send_command(k)
 
         fig.canvas.mpl_connect("key_press_event", on_key)
@@ -289,8 +302,8 @@ class VibrationVisualizer:
 def main():
     parser = argparse.ArgumentParser(description="Real-time Vibration Sensor Visualizer & FFT Spectrum")
     parser.add_argument("--port", type=str, default=None, help="Serial COM port (e.g. COM3 or /dev/ttyUSB0)")
-    parser.add_argument("--baud", type=int, default=115200, help="Baud rate (default: 115200)")
-    parser.add_argument("--window", type=int, default=800, help="Rolling sample buffer size (default: 800)")
+    parser.add_argument("--baud", type=int, default=921600, help="Baud rate (default: 921600)")
+    parser.add_argument("--window", type=int, default=1600, help="Rolling sample buffer size (default: 1600)")
     args = parser.parse_args()
 
     port = args.port or auto_detect_port()

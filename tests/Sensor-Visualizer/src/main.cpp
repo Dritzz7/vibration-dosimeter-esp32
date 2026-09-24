@@ -135,9 +135,9 @@ bool configureSensorODR(uint16_t rateHz) {
         case 100:  bwVal = BW_RATE_100HZ;  decimationFactor = 1; break;
         case 200:  bwVal = BW_RATE_200HZ;  decimationFactor = 1; break;
         case 400:  bwVal = BW_RATE_400HZ;  decimationFactor = 1; break;
-        case 800:  bwVal = BW_RATE_800HZ;  decimationFactor = 2; break; // Downsample 2x for 115200 baud
-        case 1600: bwVal = BW_RATE_1600HZ; decimationFactor = 4; break; // Downsample 4x for 115200 baud
-        case 3200: bwVal = BW_RATE_3200HZ; decimationFactor = 8; break; // Downsample 8x for 115200 baud
+        case 800:  bwVal = BW_RATE_800HZ;  decimationFactor = 1; break; // Stream 800 Hz full (921600 baud)
+        case 1600: bwVal = BW_RATE_1600HZ; decimationFactor = 1; break; // Stream 1600 Hz full (921600 baud)
+        case 3200: bwVal = BW_RATE_3200HZ; decimationFactor = 2; break; // Stream 1600 Hz (3200/2) for safe UART margin
         default:
             Serial.printf("[ERR] Unsupported rate %d Hz! Valid: 100, 200, 400, 800, 1600, 3200\n", rateHz);
             return false;
@@ -233,6 +233,176 @@ void resetTareCalibration() {
 }
 
 // =============================================================================
+// RION VE-10 STANDARD VIBRATION CALIBRATION ROUTINE
+// =============================================================================
+void runRionCalibrationRoutine() {
+    Serial.println();
+    Serial.println("================================================================");
+    Serial.println("   RION VE-10 STANDARD VIBRATION CALIBRATION ROUTINE            ");
+    Serial.println("   Standard Reference: 159.2 Hz (1000 rad/s) @ 10.00 m/s^2 RMS  ");
+    Serial.println("================================================================");
+    Serial.println("# [CAL] Preparing high-precision sampling (ODR = 1600 Hz)...");
+    Serial.println("# [CAL] Please ensure RION VE-10 is mounted firmly and vibrating!");
+    Serial.println("# [CAL] Sampling 3200 points (2.0 seconds duration)...");
+
+    // Save current configuration
+    uint16_t prevRate = targetRateHz;
+    bool prevStream = streamingActive;
+    streamingActive = false; // Pause stream during calibration
+
+    // Configure ODR to 1600 Hz (10x of 159.2 Hz for excellent Nyquist margin)
+    configureSensorODR(1600);
+    delay(200);
+
+    const int SAMPLES = 3200;
+    const uint32_t samplePeriodUs = 625; // 1,000,000 / 1600
+
+    float *xArr = (float *)malloc(SAMPLES * sizeof(float));
+    float *yArr = (float *)malloc(SAMPLES * sizeof(float));
+    float *zArr = (float *)malloc(SAMPLES * sizeof(float));
+
+    if (!xArr || !yArr || !zArr) {
+        Serial.println("[ERR] Memory allocation failed for calibration buffer!");
+        if (xArr) free(xArr);
+        if (yArr) free(yArr);
+        if (zArr) free(zArr);
+        configureSensorODR(prevRate);
+        streamingActive = prevStream;
+        return;
+    }
+
+    const float scale = ADXL_SCALE_G_PER_LSB * (unitIsMps2 ? G_TO_MPS2 : 1.0f);
+    uint32_t nextT = micros();
+    double sumX = 0, sumY = 0, sumZ = 0;
+
+    for (int i = 0; i < SAMPLES; i++) {
+        while ((int32_t)(micros() - nextT) < 0) {
+            // Tight wait for deterministic sampling interval
+        }
+        nextT += samplePeriodUs;
+
+        int16_t rx, ry, rz;
+        if (readBurstData(sensorAddress, rx, ry, rz)) {
+            float vx = rx * scale;
+            float vy = ry * scale;
+            float vz = rz * scale;
+            xArr[i] = vx;
+            yArr[i] = vy;
+            zArr[i] = vz;
+            sumX += vx;
+            sumY += vy;
+            sumZ += vz;
+        } else {
+            xArr[i] = 0;
+            yArr[i] = 0;
+            zArr[i] = 0;
+        }
+    }
+
+    // 1. Calculate DC mean (Earth gravity component + sensor static offset)
+    float meanX = (float)(sumX / SAMPLES);
+    float meanY = (float)(sumY / SAMPLES);
+    float meanZ = (float)(sumZ / SAMPLES);
+
+    // 2. Calculate AC RMS (DC subtracted) and detect zero-crossings for frequency estimation
+    double sumSqX = 0, sumSqY = 0, sumSqZ = 0;
+    float peakX = 0, peakY = 0, peakZ = 0;
+    int crossX = 0, crossY = 0, crossZ = 0;
+
+    for (int i = 0; i < SAMPLES; i++) {
+        float acX = xArr[i] - meanX;
+        float acY = yArr[i] - meanY;
+        float acZ = zArr[i] - meanZ;
+
+        sumSqX += acX * acX;
+        sumSqY += acY * acY;
+        sumSqZ += acZ * acZ;
+
+        if (fabsf(acX) > peakX) peakX = fabsf(acX);
+        if (fabsf(acY) > peakY) peakY = fabsf(acY);
+        if (fabsf(acZ) > peakZ) peakZ = fabsf(acZ);
+
+        if (i > 0) {
+            float prevAcX = xArr[i - 1] - meanX;
+            float prevAcY = yArr[i - 1] - meanY;
+            float prevAcZ = zArr[i - 1] - meanZ;
+            if (prevAcX < 0 && acX >= 0) crossX++;
+            if (prevAcY < 0 && acY >= 0) crossY++;
+            if (prevAcZ < 0 && acZ >= 0) crossZ++;
+        }
+    }
+
+    float rmsX = sqrtf(sumSqX / SAMPLES);
+    float rmsY = sqrtf(sumSqY / SAMPLES);
+    float rmsZ = sqrtf(sumSqZ / SAMPLES);
+
+    free(xArr);
+    free(yArr);
+    free(zArr);
+
+    // 3. Identify dominant excitation axis
+    char domAxis = 'Z';
+    float domRms = rmsZ;
+    float domPeak = peakZ;
+    float domMean = meanZ;
+    int domCross = crossZ;
+
+    if (rmsX > domRms && rmsX > rmsY) {
+        domAxis = 'X';
+        domRms = rmsX;
+        domPeak = peakX;
+        domMean = meanX;
+        domCross = crossX;
+    } else if (rmsY > domRms) {
+        domAxis = 'Y';
+        domRms = rmsY;
+        domPeak = peakY;
+        domMean = meanY;
+        domCross = crossY;
+    }
+
+    float estFreq = (float)domCross / 2.0f; // 2.0s duration
+    float refRms = unitIsMps2 ? 10.00f : 1.02f;
+    float kCal = (domRms > 0.001f) ? (refRms / domRms) : 1.0f;
+    float errPct = ((domRms - refRms) / refRms) * 100.0f;
+    float crestFactor = (domRms > 0.001f) ? (domPeak / domRms) : 0.0f;
+
+    // 4. Print Calibration Certificate & Results
+    Serial.println("\n----------------------------------------------------------------");
+    Serial.println("          RION VE-10 CALIBRATION CERTIFICATE & RESULTS          ");
+    Serial.println("----------------------------------------------------------------");
+    Serial.printf(" Active Dominant Axis  : Axis %c\n", domAxis);
+    Serial.printf(" Estimated Frequency   : %.1f Hz  (Target Ref: 159.2 Hz)\n", estFreq);
+    Serial.printf(" Reference Standard    : %.3f %s (RMS)\n", refRms, unitIsMps2 ? "m/s^2" : "g");
+    Serial.printf(" Measured Dynamic RMS  : %.3f %s\n", domRms, unitIsMps2 ? "m/s^2" : "g");
+    Serial.printf(" Measured Dynamic Peak : %.3f %s  (Crest Factor: %.2f, Ideal Sine: 1.41)\n",
+                  domPeak, unitIsMps2 ? "m/s^2" : "g", crestFactor);
+    Serial.printf(" Measured Static DC    : %+.3f %s (Earth Gravity Component)\n",
+                  domMean, unitIsMps2 ? "m/s^2" : "g");
+    Serial.printf(" Initial Sensor Error  : %+.2f %%\n", errPct);
+    Serial.println("----------------------------------------------------------------");
+    Serial.printf(" >>> RECOMMENDED CORRECTION FACTOR (K_cal) = %.4f <<<\n", kCal);
+    Serial.println("----------------------------------------------------------------");
+    Serial.println(" Summary per Axis:");
+    Serial.printf("   Axis X: RMS = %6.3f %s | DC = %+6.3f %s | Peak = %6.3f\n",
+                  rmsX, unitIsMps2 ? "m/s^2" : "g", meanX, unitIsMps2 ? "m/s^2" : "g", peakX);
+    Serial.printf("   Axis Y: RMS = %6.3f %s | DC = %+6.3f %s | Peak = %6.3f\n",
+                  rmsY, unitIsMps2 ? "m/s^2" : "g", meanY, unitIsMps2 ? "m/s^2" : "g", peakY);
+    Serial.printf("   Axis Z: RMS = %6.3f %s | DC = %+6.3f %s | Peak = %6.3f\n",
+                  rmsZ, unitIsMps2 ? "m/s^2" : "g", meanZ, unitIsMps2 ? "m/s^2" : "g", peakZ);
+    Serial.println("----------------------------------------------------------------");
+    Serial.println(" C++ Code Snippet for HAV-Node & Main-Unit firmware:");
+    Serial.println();
+    Serial.printf("#define CAL_FACTOR_%c  %.4ff\n", domAxis, kCal);
+    Serial.println();
+    Serial.println("================================================================\n");
+
+    // Restore previous configuration
+    configureSensorODR(prevRate);
+    streamingActive = prevStream;
+}
+
+// =============================================================================
 // CLI COMMAND PARSER
 // =============================================================================
 void printHelp() {
@@ -245,6 +415,7 @@ void printHelp() {
     Serial.println(" [4] Set ODR to 800 Hz");
     Serial.println(" [5] Set ODR to 1600 Hz");
     Serial.println(" [6] Set ODR to 3200 Hz (ISO 5349-1 HAV Standard)");
+    Serial.println(" [c] Run RION VE-10 Standard Calibration Routine (159.2 Hz @ 10 m/s^2)");
     Serial.println(" [t] Tare Zero Offset   (Calibrate stationary DC offset)");
     Serial.println(" [r] Reset Tare Offset  (Show absolute 1g Earth gravity)");
     Serial.println(" [u] Toggle Units       (Switch between m/s^2 and g)");
@@ -279,6 +450,7 @@ void handleSerialCommands() {
         case '4': configureSensorODR(800);  break;
         case '5': configureSensorODR(1600); break;
         case '6': configureSensorODR(3200); break;
+        case 'c': case 'C': runRionCalibrationRoutine(); break;
         case 't': case 'T': performTareCalibration(); break;
         case 'r': case 'R': resetTareCalibration();   break;
         case 'u': case 'U':
@@ -299,7 +471,7 @@ void handleSerialCommands() {
 // SETUP
 // =============================================================================
 void setup() {
-    Serial.begin(115200);
+    Serial.begin(921600);
     delay(500);
 
     Serial.println();
@@ -308,7 +480,7 @@ void setup() {
     Serial.println("========================================================");
 
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(400000); // 400 kHz Fast-Mode I2C
+    Wire.setClock(800000); // 800 kHz Fast-Mode Plus I2C
 
     if (!initADXL345()) {
         Serial.println("[CRITICAL] Sensor initialization failed! System halted.");
@@ -320,7 +492,7 @@ void setup() {
     printHelp();
     delay(1000);
 
-    Serial.println("# Output format: ax:VALUE,ay:VALUE,az:VALUE,amag:VALUE");
+    Serial.println("# Output format: ax,ay,az");
     nextSampleMicros = micros();
     lastStatsMillis  = millis();
 }
@@ -365,9 +537,8 @@ void loop() {
                 decimationCounter++;
                 if (decimationCounter >= decimationFactor) {
                     decimationCounter = 0;
-                    // Standard Serial Plotter & Teleplot key:value format
-                    Serial.printf("ax:%.3f,ay:%.3f,az:%.3f,amag:%.3f\n",
-                                  ax, ay, az, amag);
+                    // Compact high-throughput CSV format (ax,ay,az)
+                    Serial.printf("%.3f,%.3f,%.3f\n", ax, ay, az);
                 }
             }
         }
