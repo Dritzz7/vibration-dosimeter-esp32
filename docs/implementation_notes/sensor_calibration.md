@@ -22,37 +22,60 @@ Kalibrator getaran elektromekanis **RION VE-10** menghasilkan sinyal sinusoidal 
 ## 2. Landasan Teori & Pemisahan Komponen DC (Gravitasi Bumi)
 
 ### A. Masalah Komponen DC Statis
+
 Saat sensor ADXL345 dipasang pada dudukan silinder kalibrator, sensor berada di bawah medan gravitasi bumi ($1\text{ g} \approx 9{,}807\text{ m/s}^2$). Sumbu penginderaan yang sejajar dengan arah getar kalibrator (misal sumbu Z vertikal) akan membaca superposisi dua sinyal sekaligus:
+
 1. **Sinyal AC Dinamis:** Getaran sinusoidal murni kalibrator dengan amplitudo acuan $10{,}00\text{ m/s}^2\text{ RMS}$.
 2. **Sinyal DC Statis:** Komponen proyeksi percepatan gravitasi bumi $g_{\text{proj}}$ ditambah *zero-g offset* bawaan silikon sensor.
 
 Jika nilai RMS dihitung langsung dari sinyal total mentah ($a_{\text{raw}}$), nilai RMS yang diperoleh akan mengalami galat bias yang sangat besar:
-$$a_{\text{RMS, mentah}} = \sqrt{a_{\text{DC}}^2 + a_{\text{AC, RMS}}^2} = \sqrt{(9{,}81)^2 + (10{,}00)^2} \approx \mathbf{14{,}01\text{ m/s}^2} \quad (\text{Galat } +40\%!)$$
+
+$$
+a_{\text{RMS, mentah}} = \sqrt{a_{\text{DC}}^2 + a_{\text{AC, RMS}}^2} = \sqrt{(9{,}81)^2 + (10{,}00)^2} \approx \mathbf{14{,}01\text{ m/s}^2} \quad (\text{Galat } +40\%!)
+$$
 
 ### B. Solusi Matematika: Eliminasi Komponen DC
+
 Komponen rata-rata DC ($\bar{a}$) harus dihitung dan dieliminasi terlebih dahulu untuk setiap $N$ sampel data akuisisi:
-$$\bar{a} = \frac{1}{N}\sum_{i=1}^{N} a_i$$
+
+$$
+\bar{a} = \frac{1}{N}\sum_{i=1}^{N} a_i
+$$
 
 Sinyal getaran murni yang diisolasi adalah:
-$$a_{\text{AC}, i} = a_i - \bar{a}$$
+
+$$
+a_{\text{AC}, i} = a_i - \bar{a}
+$$
 
 Maka nilai percepatan getaran RMS yang sebenarnya adalah nilai standar deviasi dari sinyal terukur:
-$$a_{\text{vib, RMS}} = \sqrt{\frac{1}{N}\sum_{i=1}^{N} (a_{\text{AC}, i})^2} = \sqrt{\frac{1}{N}\sum_{i=1}^{N} (a_i - \bar{a})^2} = \operatorname{std}(a)$$
+
+$$
+a_{\text{vib, RMS}} = \sqrt{\frac{1}{N}\sum_{i=1}^{N} (a_{\text{AC}, i})^2} = \sqrt{\frac{1}{N}\sum_{i=1}^{N} (a_i - \bar{a})^2} = \operatorname{std}(a)
+$$
 
 ### C. Penentuan Faktor Pengali Kalibrasi ($K_{\text{cal}}$)
+
 Faktor koreksi kalibrasi ($K_{\text{cal}}$) dihitung dengan membandingkan nilai referensi kalibrator terhadap nilai RMS dinamik yang diukur oleh sensor:
-$$K_{\text{cal}} = \frac{a_{\text{ref, RMS}}}{a_{\text{vib, RMS}}} = \frac{10{,}000\text{ m/s}^2}{a_{\text{vib, RMS}}}$$
+
+$$
+K_{\text{cal}} = \frac{a_{\text{ref, RMS}}}{a_{\text{vib, RMS}}} = \frac{10{,}000\text{ m/s}^2}{a_{\text{vib, RMS}}}
+$$
 
 Persentase galat awal sensor (*uncalibrated error*):
-$$\text{Error} (\%) = \left(\frac{a_{\text{vib, RMS}} - a_{\text{ref, RMS}}}{a_{\text{ref, RMS}}}\right) \times 100\%$$
+
+$$
+\text{Error} (\%) = \left(\frac{a_{\text{vib, RMS}} - a_{\text{ref, RMS}}}{a_{\text{ref, RMS}}}\right) \times 100\%
+$$
 
 ---
 
 ## 3. Fitur Kalibrasi Otomatis pada `Sensor-Visualizer`
 
-Firmware [`tests/Sensor-Visualizer/src/main.cpp`](file:///d:/Users/Rafi%20Ananta%20Alden/Documents/Kuliah/Semester%208/EL4060/vibration-dosimeter-esp32/tests/Sensor-Visualizer/src/main.cpp) telah dilengkapi dengan fungsi kalibrasi presisi tinggi: `runRionCalibrationRoutine()`.
+Firmware [`tests/Sensor-Visualizer/src/main.cpp`](<file:///d:/Users/Rafi%20Ananta%20Alden/Documents/Kuliah/Semester%208/EL4060/vibration-dosimeter-esp32/tests/Sensor-Visualizer/src/main.cpp>) telah dilengkapi dengan fungsi kalibrasi presisi tinggi: `runRionCalibrationRoutine()`.
 
 ### Mekanisme Kerja Internal Firmware:
+
 1. **Konfigurasi Sampling Presisi:**
    Firmware otomatis menaikkan laju sampling (ODR) ADXL345 ke **$1600\text{ Hz}$** ($10\times$ lipat frekuensi eksitasi $159{,}2\text{ Hz}$) untuk menjamin margin Nyquist yang sangat tinggi dan bebas distorsi.
 2. **Akuisisi Deterministik:**
@@ -71,18 +94,23 @@ Firmware [`tests/Sensor-Visualizer/src/main.cpp`](file:///d:/Users/Rafi%20Ananta
 ## 4. Prosedur Praktis Pelaksanaan Kalibrasi
 
 ### Langkah 1: Persiapan Perangkat Keras
+
 1. Rekatkan atau pasang sensor ADXL345 (Main Unit atau HAV Node) secara kokoh pada silinder dudukan kalibrator RION VE-10 menggunakan sekrup ulir tengah atau pita perekat berkekuatan tinggi (*high-stiffness stud/mounting tape*).
 2. Hubungkan pin I2C sensor (SDA, SCL, VCC 3.3V, GND) ke ESP32.
 3. Hubungkan ESP32 ke PC melalui kabel USB.
 
 ### Langkah 2: Menjalankan Program Pengujian
+
 Buka terminal pada direktori proyek dan jalankan:
+
 ```powershell
 python tests/Sensor-Visualizer/visualizer.py
 ```
+
 *(Atau buka Serial Monitor: `pio device monitor -d tests/Sensor-Visualizer -b 921600`)*.
 
 ### Langkah 3: Menjalankan Rutinitas Kalibrasi
+
 1. Tekan tombol pada kalibrator RION VE-10 (tekan 1 kali untuk operasi 1 menit). Kalibrator akan bergetar pada $159{,}2\text{ Hz}$.
 2. Pada antarmuka `visualizer.py` (atau serial monitor), tekan tombol keyboard:
    ```text
@@ -93,7 +121,7 @@ python tests/Sensor-Visualizer/visualizer.py
 
 ```text
 ================================================================
-   RION VE-10 STANDARD VIBRATION CALIBRATION ROUTINE            
+   RION VE-10 STANDARD VIBRATION CALIBRATION ROUTINE  
    Standard Reference: 159.2 Hz (1000 rad/s) @ 10.00 m/s^2 RMS  
 ================================================================
 # [CAL] Preparing high-precision sampling (ODR = 1600 Hz)...
@@ -101,7 +129,7 @@ python tests/Sensor-Visualizer/visualizer.py
 # [CAL] Sampling 3200 points (2.0 seconds duration)...
 
 ----------------------------------------------------------------
-          RION VE-10 CALIBRATION CERTIFICATE & RESULTS          
+          RION VE-10 CALIBRATION CERTIFICATE & RESULTS  
 ----------------------------------------------------------------
  Active Dominant Axis  : Axis Z
  Estimated Frequency   : 159.0 Hz  (Target Ref: 159.2 Hz)
@@ -134,14 +162,18 @@ python tests/Sensor-Visualizer/visualizer.py
 Nilai faktor koreksi $K_{\text{cal}}$ yang diperoleh dari pengujian dimasukkan ke dalam firmware sistem utama:
 
 ### A. Pada `HAV-Node/src/main.cpp`
+
 Tambahkan definisi faktor kalibrasi di bawah konstanta ADXL345:
+
 ```cpp
 // Factory calibration factors (RION VE-10: 159.2 Hz @ 10.00 m/s^2 RMS)
 #define CAL_FACTOR_X  1.0000f
 #define CAL_FACTOR_Y  1.0000f
 #define CAL_FACTOR_Z  1.0280f // Nilai dari hasil kalibrasi
 ```
+
 Dan terapkan pada fungsi konversi percepatan:
+
 ```cpp
 ax = rawX * ADXL_SCALE_G_PER_LSB * G_TO_MPS2 * CAL_FACTOR_X;
 ay = rawY * ADXL_SCALE_G_PER_LSB * G_TO_MPS2 * CAL_FACTOR_Y;
@@ -149,14 +181,18 @@ az = rawZ * ADXL_SCALE_G_PER_LSB * G_TO_MPS2 * CAL_FACTOR_Z;
 ```
 
 ### B. Pada `Main-Unit/src/main.cpp`
+
 Tambahkan definisi yang sama untuk sensor Whole-Body Vibration (WBV):
+
 ```cpp
 // Factory calibration factors (RION VE-10: 159.2 Hz @ 10.00 m/s^2 RMS)
 #define ADXL_CAL_FACTOR_X  1.0000f
 #define ADXL_CAL_FACTOR_Y  1.0000f
 #define ADXL_CAL_FACTOR_Z  1.0280f // Nilai dari hasil kalibrasi
 ```
+
 Dan terapkan pada fungsi konversi pembacaan WBV:
+
 ```cpp
 ax = rawX * ADXL_SCALE_G_PER_LSB * G_TO_MPS2 * ADXL_CAL_FACTOR_X;
 ay = rawY * ADXL_SCALE_G_PER_LSB * G_TO_MPS2 * ADXL_CAL_FACTOR_Y;

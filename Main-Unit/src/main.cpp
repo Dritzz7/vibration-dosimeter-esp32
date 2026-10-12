@@ -97,6 +97,14 @@
 #define PIN_BUTTON            4   // Tactile push-button (active-low, internal pull-up)
 #define PIN_LED_STATUS        2   // On-board LED for status indication
 
+// --- Battery ADC Monitoring (ADC1_CH7, safe with BLE) ---
+#define ENABLE_BATTERY_MONITOR 1
+#define PIN_VBAT_SENSE        35   // GPIO 35 (ADC1_CH7) voltage divider (Input-only)
+#define VBAT_DIVIDER_RATIO    2.0f // R1=100k, R2=100k resistor divider
+#define VBAT_MIN_VALID        2.80f// Minimum valid battery voltage (filters floating pin on USB)
+#define VBAT_LOW_THRESHOLD    3.40f// Low battery cut-off warning (V)
+#define VBAT_CRITICAL_THRESHOLD 3.20f// Critical battery threshold (V)
+
 // --- GPS Module (u-blox NEO-6M via UART2) ---
 #define PIN_GPS_RX           16   // ESP32 RX2 connected to GPS TX
 #define PIN_GPS_TX           17   // ESP32 TX2 connected to GPS RX
@@ -285,6 +293,12 @@ static GpsData_t      latestGpsData = {0.0, 0.0, 0.0f, 0, 99.99f, 0, 0xFFFFFFFFU
 static volatile bool bleConnected   = false;   // true = HAV Node BLE link is up
 static volatile bool bleHavDataOK   = false;   // true = at least one valid packet received
 
+// Battery monitoring state (updated periodically by vTaskHMIAndController)
+static float   vbatVoltage = 0.0f;
+static uint8_t vbatPercent = 0;
+static bool    vbatValid   = false;
+static bool    vbatLow     = false;
+
 // Global driver instances
 static RTC_DS3231 rtc;
 static Adafruit_SH1106G oled(128, 64, &Wire, -1);
@@ -448,6 +462,38 @@ static uint32_t rtc_getUnixTimestamp() {
     }
     return ts;
 }
+
+// =============================================================================
+// BATTERY ADC HELPER (GPIO 35 — ADC1_CH7)
+// =============================================================================
+#if ENABLE_BATTERY_MONITOR
+/**
+ * @brief Sample battery voltage through resistive divider on GPIO 35 (ADC1_CH7).
+ *        Uses multi-sample averaging (16 samples) to filter transient switching noise.
+ * @return Measured battery voltage in Volts.
+ */
+static float readBatteryVoltage() {
+    uint32_t rawSum = 0;
+    const uint8_t SAMPLES = 16;
+    for (uint8_t i = 0; i < SAMPLES; i++) {
+        rawSum += analogRead(PIN_VBAT_SENSE);
+    }
+    const float rawAvg = (float)rawSum / (float)SAMPLES;
+    const float pinVoltage = (rawAvg / 4095.0f) * 3.3f;
+    return pinVoltage * VBAT_DIVIDER_RATIO;
+}
+
+/**
+ * @brief Convert measured battery voltage to estimated charge percentage (0-100%).
+ *        Assumes standard single-cell Li-Ion (3.40V = 0%, 4.20V = 100%).
+ */
+static uint8_t calculateBatteryPercentage(float vbat) {
+    if (vbat >= 4.20f) return 100;
+    if (vbat <= 3.40f) return 0;
+    float pct = ((vbat - 3.40f) / (4.20f - 3.40f)) * 100.0f;
+    return (uint8_t)pct;
+}
+#endif
 
 /**
  * @brief  Read current date-time from DS3231 via I2C formatted as YYYY-MM-DD HH:MM:SS (WIB).
@@ -1064,6 +1110,32 @@ static void vTaskDataLogger(void *pvParameters) {
                 }
             }
 
+#if ENABLE_BATTERY_MONITOR
+            if (vbatValid) {
+                LOG_I(TAG, "LOGGER t=%s | HAV ahv=%.4f | WBV av=%.4f | GPS fix=%d sat=%lu spd=%.1f km/h alt=%.1f m hdop=%.2f | BAT=%.2fV (%u%%)%s",
+                      timeStr,
+                      havReceived ? havData.ahv  : 0.0f,
+                      wbvReceived ? wbvData.av   : 0.0f,
+                      gpsSnap.fixValid ? 1 : 0,
+                      (unsigned long)gpsSnap.satellites,
+                      gpsSnap.speedKmh,
+                      gpsSnap.altitudeMM / 1000.0f,
+                      gpsSnap.hdop,
+                      vbatVoltage,
+                      vbatPercent,
+                      vbatLow ? " [LOW BATTERY]" : "");
+            } else {
+                LOG_I(TAG, "LOGGER t=%s | HAV ahv=%.4f | WBV av=%.4f | GPS fix=%d sat=%lu spd=%.1f km/h alt=%.1f m hdop=%.2f | BAT=USB",
+                      timeStr,
+                      havReceived ? havData.ahv  : 0.0f,
+                      wbvReceived ? wbvData.av   : 0.0f,
+                      gpsSnap.fixValid ? 1 : 0,
+                      (unsigned long)gpsSnap.satellites,
+                      gpsSnap.speedKmh,
+                      gpsSnap.altitudeMM / 1000.0f,
+                      gpsSnap.hdop);
+            }
+#else
             LOG_I(TAG, "LOGGER t=%s | HAV ahv=%.4f | WBV av=%.4f | GPS fix=%d sat=%lu spd=%.1f km/h alt=%.1f m hdop=%.2f",
                   timeStr,
                   havReceived ? havData.ahv  : 0.0f,
@@ -1073,6 +1145,7 @@ static void vTaskDataLogger(void *pvParameters) {
                   gpsSnap.speedKmh,
                   gpsSnap.altitudeMM / 1000.0f,
                   gpsSnap.hdop);
+#endif
         }
     }
 }
@@ -1230,6 +1303,32 @@ static void vTaskHMIAndController(void *pvParameters) {
                 break;
         }
 
+        // ── Periodic Battery Voltage Monitoring (every 3 seconds) ────────────
+#if ENABLE_BATTERY_MONITOR
+        static uint32_t lastBatteryCheckMs = 0;
+        if (now - lastBatteryCheckMs >= 3000UL) {
+            lastBatteryCheckMs = now;
+            const float vbat = readBatteryVoltage();
+            if (vbat >= VBAT_MIN_VALID) {
+                vbatVoltage = vbat;
+                vbatPercent = calculateBatteryPercentage(vbat);
+                vbatValid   = true;
+                bool wasLow = vbatLow;
+                vbatLow     = (vbat < VBAT_LOW_THRESHOLD);
+
+                if (vbatLow && !wasLow) {
+                    LOG_W("PWR", "Low battery warning! Vbat=%.2f V (%u%%) < %.2f V",
+                          vbatVoltage, vbatPercent, VBAT_LOW_THRESHOLD);
+                }
+            } else {
+                vbatVoltage = vbat;
+                vbatPercent = 0;
+                vbatValid   = false;
+                vbatLow     = false;
+            }
+        }
+#endif
+
         // ════════════════════════════════════════════════════════════════════
         // 3. OLED UPDATE at 1 Hz + SCREEN-SAVER
         // ════════════════════════════════════════════════════════════════════
@@ -1239,7 +1338,15 @@ static void vTaskHMIAndController(void *pvParameters) {
 
             // Screen-saver: blank after inactivity during LOGGING
             const uint32_t idleSeconds = (now - lastActivityMs) / 1000UL;
-            if (state == SYS_LOGGING && idleSeconds >= OLED_SCREENSAVER_S) {
+
+            // Auto-wake screensaver if battery drops to warning level!
+            if (vbatLow && screenSaverActive) {
+                screenSaverActive = false;
+                lastActivityMs = now;
+                LOG_W(TAG, "Screensaver interrupted: Low Battery Alert!");
+            }
+
+            if (state == SYS_LOGGING && idleSeconds >= OLED_SCREENSAVER_S && !vbatLow) {
                 if (!screenSaverActive) {
                     screenSaverActive = true;
                     LOG_I(TAG, "OLED screensaver activated (blinking dot mode)");
@@ -1264,14 +1371,29 @@ static void vTaskHMIAndController(void *pvParameters) {
                     oled.setTextColor(SH110X_WHITE);
                     oled.setCursor(0, 0);
 
-                    oled.println("VIBRATION DOSIMETER");
+                    // Line 0: Header with Battery Indicator
+                    if (vbatValid) {
+                        if (vbatLow) {
+                            static bool warnBlink = false;
+                            warnBlink = !warnBlink;
+                            if (warnBlink) {
+                                oled.printf("VIB DOSI  [! %2u%% !]\n", vbatPercent);
+                            } else {
+                                oled.printf("VIB DOSI  [!%.2fV!]\n", vbatVoltage);
+                            }
+                        } else {
+                            oled.printf("VIB DOSI   [%2u%%] %.1fV\n", vbatPercent, vbatVoltage);
+                        }
+                    } else {
+                        oled.println("VIB DOSIMETER  (USB)");
+                    }
                     oled.println("====================");
                     oled.print("STATUS: ");
                     switch (state) {
                         case SYS_INIT:      oled.println("INIT");      break;
                         case SYS_SELF_TEST: oled.println("SELF TEST"); break;
                         case SYS_READY:     oled.println("READY");     break;
-                        case SYS_LOGGING:   oled.println("LOGGING");   break;
+                        case SYS_LOGGING:   oled.println(vbatLow ? "LOG (!BAT)" : "LOGGING"); break;
                         case SYS_ERROR:     oled.println("ERROR");     break;
                     }
 
@@ -1304,6 +1426,23 @@ static void vTaskHMIAndController(void *pvParameters) {
                     oled.display();
                 }
             }
+        }
+
+        // ── 4. STATUS LED INDICATION (GPIO 2) ─────────────────────────────────
+        static uint8_t ledTick = 0;
+        ledTick++;
+        if (vbatLow) {
+            // Rapid 5 Hz flash when battery is low (100ms ON, 100ms OFF)
+            digitalWrite(PIN_LED_STATUS, (ledTick % 2 == 0) ? HIGH : LOW);
+        } else if (state == SYS_LOGGING) {
+            // 1 Hz heartbeat blink during active logging (100ms ON every 10 ticks)
+            digitalWrite(PIN_LED_STATUS, (ledTick % 10 == 0) ? HIGH : LOW);
+        } else if (state == SYS_ERROR) {
+            // Solid ON during system error
+            digitalWrite(PIN_LED_STATUS, HIGH);
+        } else {
+            // OFF during READY / INIT
+            digitalWrite(PIN_LED_STATUS, LOW);
         }
 
         // Activity tracker: reset screensaver if button pressed
@@ -1412,6 +1551,25 @@ static void runSelfTest() {
     gpsHardwareOK = gpsGotNmea;
     LOG_I("INIT", "GPS u-blox NEO-6M UART2 probe: %s", gpsHardwareOK ? "OK (NMEA stream live)" : "NO RESPONSE / DISCONNECTED");
 
+    // Battery Probe
+#if ENABLE_BATTERY_MONITOR
+    const float initVbat = readBatteryVoltage();
+    if (initVbat >= VBAT_MIN_VALID) {
+        vbatVoltage = initVbat;
+        vbatPercent = calculateBatteryPercentage(initVbat);
+        vbatValid   = true;
+        vbatLow     = (initVbat < VBAT_LOW_THRESHOLD);
+        LOG_I("INIT", "Battery probe: %.2f V (%u%%)%s",
+              vbatVoltage, vbatPercent, vbatLow ? " [LOW BATTERY WARNING]" : " [OK]");
+    } else {
+        vbatVoltage = initVbat;
+        vbatPercent = 0;
+        vbatValid   = false;
+        vbatLow     = false;
+        LOG_I("INIT", "Battery probe: %.2f V (No battery / USB powered)", initVbat);
+    }
+#endif
+
     LOG_I("INIT", "Self-test complete: WBV=%d RTC=%d SD=%d OLED=%d GPS=%d",
           wbvSensorOK, rtcOK, sdOK, oledOK, gpsHardwareOK);
 }
@@ -1507,6 +1665,10 @@ void setup() {
     pinMode(PIN_BUTTON,     INPUT_PULLUP);
     pinMode(PIN_LED_STATUS, OUTPUT);
     digitalWrite(PIN_LED_STATUS, LOW);
+
+#if ENABLE_BATTERY_MONITOR
+    pinMode(PIN_VBAT_SENSE, INPUT);
+#endif
 
     // Initial system state
     systemState = SYS_INIT;
