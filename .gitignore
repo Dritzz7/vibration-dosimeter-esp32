@@ -3,6 +3,5 @@
 .DS_Store
 *.log
 docs/ref/b400_algoritma_draft.md
-tests/GPS
 .gitignore
 docs/dummy.md

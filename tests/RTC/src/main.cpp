@@ -15,7 +15,7 @@ constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
 
 // the pin that is connected to SQW
-#define CLOCK_INTERRUPT_PIN 2
+#define CLOCK_INTERRUPT_PIN 13
 
 void onAlarm();
 
