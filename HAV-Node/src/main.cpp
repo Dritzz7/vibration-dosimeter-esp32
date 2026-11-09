@@ -1,12 +1,13 @@
 /**
  * @file    main.cpp
- * @brief   Vibration Dosimeter ESP32 — HAV Node Firmware (Single-Core Polling)
+ * @brief   Vibration Dosimeter ESP32 — HAV Node Firmware (SPI 5MHz + Hardware Interrupt)
  *
  * @details Hand-Arm Vibration (HAV) edge processing node conforming to ISO 5349-1.
  *
  *          ┌──────────────────────────────────────────────────────────────────┐
  *          │  Main Loop (Core 1)                                              │
- *          │   • High-frequency ADXL345 acquisition (3200 Hz via micro timer) │
+ *          │   • Hardware Interrupt-driven ADXL345 acquisition (3200 Hz ODR)  │
+ *          │   • High-speed 4-wire SPI bus @ 5 MHz (SCK:18, MISO:19, MOSI:23) │
  *          │   • ISO 5349-1 frequency weighting filter (Wh on X, Y, Z axes)   │
  *          │   • Accumulates 1-second RMS epoch (3200 samples)                 │
  *          │   • Transmits RMS results over BLE as GATT Server (Peripheral)    │
@@ -16,20 +17,20 @@
  *          Characteristic (NOTIFY) to receive one-second epoch data.
  *          Payload format: "HAV,seq,millis_ms,ahwx,ahwy,ahwz,ahv,n_samples"
  *
- * @note    Target Hardware : ESP32 Dual-Core (240 MHz)
+ * @note    Target Hardware : ESP32 Dual-Core (240 MHz) — Custom PCB hardware-dosimeter
  *          Framework       : Arduino Core
- *          HAV Sensor      : ADXL345 (I2C, auto-detect 0x53 or 0x1D), 3200 Hz ODR
+ *          HAV Sensor      : ADXL345 (4-wire SPI @ 5 MHz, INT1 on GPIO35), 3200 Hz ODR
  *          BLE Role        : BLE Server ("HAV_NODE" device name)
  *
  * @author  Team EL4060
- * @date    2026-06-17
+ * @date    2026-10-12
  */
 
 // =============================================================================
 // INCLUDES
 // =============================================================================
 #include <Arduino.h>
-#include <Wire.h>
+#include <SPI.h>
 
 // BLE Server (ESP32 built-in Bluetooth stack)
 #include <BLEDevice.h>
@@ -65,18 +66,21 @@
 #endif
 
 // =============================================================================
-// HARDWARE PIN DEFINITIONS
+// HARDWARE PIN DEFINITIONS (PCB hardware-dosimeter Rev A)
 // =============================================================================
-// --- I2C Bus (shared: HAV sensor) ---
-#define PIN_I2C_SDA          21
-#define PIN_I2C_SCL          22
+// --- ADXL345 4-wire SPI Bus ---
+#define PIN_SPI_SCK          18    ///< GPIO18 (via R4 33R)
+#define PIN_SPI_MISO         19    ///< GPIO19 (direct to MISO)
+#define PIN_SPI_MOSI         23    ///< GPIO23 (via R5 33R)
+#define PIN_ADXL_CS          25    ///< GPIO25 (via R6 33R + R7 10k pull-up to 3.3V)
+#define PIN_ADXL_INT1        35    ///< GPIO35 (ADXL345 INT1 Data Ready interrupt)
 
-// --- Battery ADC Monitoring (ADC1, safe with BLE) ---
-#define ENABLE_BATTERY_MONITOR 1     ///< Set 1 when battery divider is connected to GPIO34, 0 for USB bench testing
+// --- Battery ADC Monitoring (2S Li-ion pack: nominal 7.4V, max 8.4V) ---
+#define ENABLE_BATTERY_MONITOR 1     ///< Set 1 when battery divider is connected to GPIO34
 #define PIN_VBAT_SENSE         34    ///< GPIO34 (ADC1_CH6) voltage divider
-#define VBAT_DIVIDER_RATIO     2.0f  ///< R1=100k, R2=100k resistor divider
-#define VBAT_MIN_VALID         2.80f ///< Minimum valid battery voltage (filters floating pin on USB)
-#define VBAT_LOW_THRESHOLD     3.40f ///< Low battery cut-off warning (V)
+#define VBAT_DIVIDER_RATIO     4.30f ///< R8=330k (1%), R9=100k (1%) -> (330k+100k)/100k = 4.30
+#define VBAT_MIN_VALID         5.50f ///< Minimum valid battery voltage (filters floating pin on USB test bench)
+#define VBAT_LOW_THRESHOLD     6.60f ///< Low battery cut-off warning for 2S pack (3.30V per cell)
 
 // --- Mini RGB LED (KY-016 / SMD 0805) ---
 // NOTE: GPIO 25 (DAC1/ADC2/RTC) conflicts with ESP32 BLE stack when BLE is active.
@@ -115,16 +119,16 @@ typedef enum {
 #define STATE_LOW_BATTERY          HAV_STATE_LOW_BATTERY
 
 // =============================================================================
-// ADXL345 REGISTER MAP & CONFIG
+// ADXL345 REGISTER MAP & SPI CONFIG
 // =============================================================================
-#define ADXL345_ADDR_1       0x53   // Primary I2C address (SDO tied to GND)
-#define ADXL345_ADDR_2       0x1D   // Secondary I2C address (SDO tied to VCC)
-
-#define REG_DEVID            0x00   // Device ID Register
+#define REG_DEVID            0x00   // Device ID Register (Expected 0xE5)
 #define REG_BW_RATE          0x2C   // Data rate and power control
 #define REG_POWER_CTL        0x2D   // Power-saving features control
+#define REG_INT_ENABLE       0x2E   // Interrupt enable control
+#define REG_INT_MAP          0x2F   // Interrupt mapping control
+#define REG_INT_SOURCE       0x30   // Interrupt source (clears on read)
 #define REG_DATA_FORMAT      0x31   // Data format control
-#define REG_DATAX0           0x32   // X-Axis Data 0 (start register for tri-axial read)
+#define REG_DATAX0           0x32   // X-Axis Data 0 (start register for burst read)
 
 #define ADXL345_DEVID_VALUE  0xE5   // Expected Device ID for ADXL345
 
@@ -147,16 +151,18 @@ typedef enum {
 // =============================================================================
 const float FS = FS_HAV;                     ///< 3200 Hz sampling rate (from hav_coefficients.h)
 
-// 1 / 3200 Hz = 312.5 us period.
-// Multiplied by 100 to represent 312.5 us precisely as an integer (31250) for micros() usage.
+// 1 / 3200 Hz = 312.5 us period (fallback for simulation / diagnostics)
 const uint32_t SAMPLE_PERIOD_US_X100 = 31250;
 const uint16_t HAV_EPOCH_SAMPLES = 3200;     ///< Epoch window of 1 second (3200 samples)
 
 // =============================================================================
-// GLOBAL STATE
+// GLOBAL STATE & INTERRUPT SYNCHRONIZATION
 // =============================================================================
-uint8_t adxlAddress = 0x00;              ///< Detected ADXL345 I2C address
-bool adxlAvailable = false;             ///< True if ADXL345 is successfully initialized
+bool adxlAvailable = false;                 ///< True if ADXL345 is successfully initialized
+
+// FreeRTOS Task & ISR synchronization variables for GPIO35 (ADXL_INT1)
+static volatile bool s_dataReadyFlag  = false;
+static TaskHandle_t  s_mainTaskHandle = nullptr;
 
 BLECharacteristic *havCharacteristic = nullptr; ///< Characteristic for sending HAV data
 bool bleClientConnected = false;        ///< Connection state with BLE Client
@@ -236,179 +242,148 @@ BiquadCascade filterY(coeff_wh, NUM_SECTIONS_WH);
 BiquadCascade filterZ(coeff_wh, NUM_SECTIONS_WH);
 
 // =============================================================================
-// I2C HELPER FUNCTIONS (Wire-based, blocking)
+// SPI HELPER FUNCTIONS & INTERRUPT SERVICE ROUTINE (ADXL345)
 // =============================================================================
+static SPISettings adxlSpiSettings(5000000, MSBFIRST, SPI_MODE3);
+
 /**
- * @brief Write a single byte value to an I2C device register.
- * @param addr   I2C slave address.
- * @param reg    Register address to write to.
+ * @brief Hardware Interrupt Service Routine for ADXL345 INT1 (GPIO35).
+ *        Signals the acquisition task immediately when 3200 Hz conversion is ready.
+ */
+void IRAM_ATTR isrADXLDataReady() {
+    s_dataReadyFlag = true;
+    if (s_mainTaskHandle != nullptr) {
+        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+        vTaskNotifyGiveFromISR(s_mainTaskHandle, &xHigherPriorityTaskWoken);
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    }
+}
+
+/**
+ * @brief Write a single byte to an ADXL345 register over SPI.
+ * @param reg    Register address (0x00 to 0x3F).
  * @param value  Byte value to write.
- * @return true on success, false on failure.
+ * @return true on success.
  */
-bool writeRegister(uint8_t addr, uint8_t reg, uint8_t value) {
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    Wire.write(value);
-    return (Wire.endTransmission() == 0);
-}
-
-/**
- * @brief Read a single byte value from an I2C device register.
- * @param addr        I2C slave address.
- * @param reg         Register address to read from.
- * @param[out] value  Reference to store the read byte.
- * @return true on success, false on failure.
- */
-bool readRegister(uint8_t addr, uint8_t reg, uint8_t &value) {
-    Wire.beginTransmission(addr);
-    Wire.write(reg);
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-
-    if (Wire.requestFrom((int)addr, 1) != 1 || Wire.available() < 1) {
-        return false;
-    }
-
-    value = Wire.read();
+bool writeRegisterSPI(uint8_t reg, uint8_t value) {
+    SPI.beginTransaction(adxlSpiSettings);
+    digitalWrite(PIN_ADXL_CS, LOW);
+    SPI.transfer(reg & 0x3F); // R/W = 0 (Write), MB = 0 (Single)
+    SPI.transfer(value);
+    digitalWrite(PIN_ADXL_CS, HIGH);
+    SPI.endTransaction();
     return true;
 }
 
 /**
- * @brief Perform a burst read of multiple consecutive registers over I2C.
- * @param addr         I2C slave address.
+ * @brief Read a single byte from an ADXL345 register over SPI.
+ * @param reg         Register address.
+ * @param[out] value  Storage for the read byte.
+ * @return true on success.
+ */
+bool readRegisterSPI(uint8_t reg, uint8_t &value) {
+    SPI.beginTransaction(adxlSpiSettings);
+    digitalWrite(PIN_ADXL_CS, LOW);
+    SPI.transfer((reg & 0x3F) | 0x80); // R/W = 1 (Read), MB = 0 (Single)
+    value = SPI.transfer(0x00);
+    digitalWrite(PIN_ADXL_CS, HIGH);
+    SPI.endTransaction();
+    return true;
+}
+
+/**
+ * @brief Burst-read multiple consecutive registers from ADXL345 over SPI.
  * @param startReg     Starting register address.
- * @param[out] buffer  Buffer to store the read data.
+ * @param[out] buffer  Destination buffer.
  * @param length       Number of bytes to read.
- * @return true on success, false on failure.
+ * @return true on success.
  */
-bool readMultipleRegisters(uint8_t addr, uint8_t startReg, uint8_t *buffer, uint8_t length) {
-    Wire.beginTransmission(addr);
-    Wire.write(startReg);
-    if (Wire.endTransmission(false) != 0) {
-        return false;
-    }
-
-    if ((uint8_t)Wire.requestFrom((int)addr, (int)length) != length) {
-        while (Wire.available()) {
-            Wire.read(); // Flush any garbage
-        }
-        return false;
-    }
-
+bool readMultipleRegistersSPI(uint8_t startReg, uint8_t *buffer, uint8_t length) {
+    SPI.beginTransaction(adxlSpiSettings);
+    digitalWrite(PIN_ADXL_CS, LOW);
+    SPI.transfer((startReg & 0x3F) | 0x80 | 0x40); // R/W = 1 (Read), MB = 1 (Multi-byte)
     for (uint8_t i = 0; i < length; i++) {
-        if (!Wire.available()) {
-            return false;
-        }
-        buffer[i] = Wire.read();
+        buffer[i] = SPI.transfer(0x00);
     }
+    digitalWrite(PIN_ADXL_CS, HIGH);
+    SPI.endTransaction();
     return true;
 }
 
 // =============================================================================
-// ADXL345 DRIVER FUNCTIONS
+// ADXL345 DRIVER FUNCTIONS (SPI + GPIO35 HARDWARE INTERRUPT)
 // =============================================================================
 /**
- * @brief Scan for ADXL345 sensor address (0x53 or 0x1D) and verify Device ID.
- *        Includes full I2C bus scan for hardware troubleshooting.
- * @return true if detected, false otherwise.
- */
-bool detectADXL345() {
-    LOG_I("I2C_SCAN", "Scanning I2C bus (SDA=GPIO%d, SCL=GPIO%d)...", PIN_I2C_SDA, PIN_I2C_SCL);
-    uint8_t devicesFound = 0;
-
-    for (uint8_t addr = 1; addr < 127; addr++) {
-        Wire.beginTransmission(addr);
-        if (Wire.endTransmission() == 0) {
-            LOG_I("I2C_SCAN", "  -> I2C device found at address 0x%02X", addr);
-            devicesFound++;
-        }
-    }
-
-    if (devicesFound == 0) {
-        LOG_E("I2C_SCAN", "No I2C devices found on bus! Check SDA/SCL wiring and VCC power.");
-    }
-
-    uint8_t devid = 0;
-
-    // Check primary address 0x53
-    if (readRegister(ADXL345_ADDR_1, REG_DEVID, devid)) {
-        LOG_I("INIT", "Found device at 0x53, REG_DEVID = 0x%02X (Expected 0xE5)", devid);
-        if (devid == ADXL345_DEVID_VALUE) {
-            adxlAddress = ADXL345_ADDR_1;
-            return true;
-        }
-    }
-
-    // Check secondary address 0x1D
-    if (readRegister(ADXL345_ADDR_2, REG_DEVID, devid)) {
-        LOG_I("INIT", "Found device at 0x1D, REG_DEVID = 0x%02X (Expected 0xE5)", devid);
-        if (devid == ADXL345_DEVID_VALUE) {
-            adxlAddress = ADXL345_ADDR_2;
-            return true;
-        }
-    }
-
-    adxlAddress = 0x00;
-    return false;
-}
-
-/**
- * @brief Initialize and configure the ADXL345 sensor for 3200 Hz ODR / ±16g.
+ * @brief Initialize and configure ADXL345 sensor over SPI @ 5 MHz and enable INT1 on GPIO35.
  * @return true on successful configuration.
  */
 bool setupADXL345() {
-    // Pre-check line states for hardware diagnostic
-    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
-    pinMode(PIN_I2C_SCL, INPUT_PULLUP);
-    delayMicroseconds(50);
-    int sdaVal = digitalRead(PIN_I2C_SDA);
-    int sclVal = digitalRead(PIN_I2C_SCL);
+    pinMode(PIN_ADXL_CS, OUTPUT);
+    digitalWrite(PIN_ADXL_CS, HIGH);
+    pinMode(PIN_ADXL_INT1, INPUT);
 
-    LOG_I("I2C_SCAN", "Idle I2C Line States: SDA(GPIO%d)=%s, SCL(GPIO%d)=%s",
-          PIN_I2C_SDA, sdaVal ? "HIGH (OK)" : "LOW (SHORT/GROUNDED!)",
-          PIN_I2C_SCL, sclVal ? "HIGH (OK)" : "LOW (SHORT/GROUNDED!)");
+    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, PIN_ADXL_CS);
 
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(100000); // Start with 100 kHz I2C clock for initialization
-
-    if (!detectADXL345()) {
+    // Verify Device ID (expected 0xE5)
+    uint8_t devid = 0;
+    if (!readRegisterSPI(REG_DEVID, devid) || devid != ADXL345_DEVID_VALUE) {
+        LOG_E("INIT", "ADXL345 SPI probe failed! DEVID=0x%02X (Expected 0xE5)", devid);
         return false;
     }
 
-    LOG_I("INIT", "ADXL345 HAV detected at I2C address 0x%02X", adxlAddress);
+    LOG_I("INIT", "ADXL345 HAV detected via SPI (DEVID=0x%02X)", devid);
 
-    // 1. Enter Standby mode to configure
-    if (!writeRegister(adxlAddress, REG_POWER_CTL, 0x00)) {
+    // 1. Enter Standby mode to configure registers safely
+    if (!writeRegisterSPI(REG_POWER_CTL, 0x00)) {
         return false;
     }
 
     // 2. Set output data rate to 3200 Hz ODR
-    if (!writeRegister(adxlAddress, REG_BW_RATE, ADXL_BW_3200HZ)) {
+    if (!writeRegisterSPI(REG_BW_RATE, ADXL_BW_3200HZ)) {
         return false;
     }
 
     // 3. Set data format: Full resolution mode, Range ±16g
-    if (!writeRegister(adxlAddress, REG_DATA_FORMAT, ADXL_FORMAT_FULLRES_16G)) {
+    if (!writeRegisterSPI(REG_DATA_FORMAT, ADXL_FORMAT_FULLRES_16G)) {
         return false;
     }
 
-    // 4. Enter Measurement mode
-    if (!writeRegister(adxlAddress, REG_POWER_CTL, 0x08)) {
+    // 4. Map DATA_READY interrupt to INT1 (Pin 8 of ADXL345 -> GPIO35 on ESP32)
+    // REG_INT_MAP: Bit 7 = 0 maps DATA_READY to INT1 pin
+    if (!writeRegisterSPI(REG_INT_MAP, 0x00)) {
         return false;
     }
 
-    Wire.setClock(400000); // Raise I2C clock to 400 kHz for high-frequency polling
+    // 5. Enable DATA_READY interrupt (Bit 7 = 1 in REG_INT_ENABLE)
+    if (!writeRegisterSPI(REG_INT_ENABLE, 0x80)) {
+        return false;
+    }
 
-    LOG_I("INIT", "ADXL345 HAV configuration complete:");
+    // 6. Enter Measurement mode
+    if (!writeRegisterSPI(REG_POWER_CTL, 0x08)) {
+        return false;
+    }
+
+    // Flush any pending interrupt by reading data registers & int source
+    uint8_t dummyData[6];
+    readMultipleRegistersSPI(REG_DATAX0, dummyData, 6);
+    uint8_t dummySource = 0;
+    readRegisterSPI(REG_INT_SOURCE, dummySource);
+
+    // Attach hardware interrupt on GPIO35
+    attachInterrupt(digitalPinToInterrupt(PIN_ADXL_INT1), isrADXLDataReady, RISING);
+
+    LOG_I("INIT", "ADXL345 HAV SPI configuration complete:");
+    LOG_I("INIT", "  - Bus      : 4-wire SPI (SCK:18, MISO:19, MOSI:23, CS:25) @ 5 MHz");
+    LOG_I("INIT", "  - Interrupt: GPIO35 (ADXL_INT1 DATA_READY, RISING)");
     LOG_I("INIT", "  - Range    : +/-16g full resolution");
-    LOG_I("INIT", "  - DataRate : 3200 Hz");
+    LOG_I("INIT", "  - DataRate : 3200 Hz ODR");
 
     return true;
 }
 
 /**
- * @brief Read tri-axial acceleration from the configured ADXL345 sensor.
+ * @brief Read tri-axial acceleration from the configured ADXL345 sensor over SPI.
  * @param[out] ax  Acceleration on X-axis [m/s²]
  * @param[out] ay  Acceleration on Y-axis [m/s²]
  * @param[out] az  Acceleration on Z-axis [m/s²]
@@ -420,7 +395,7 @@ bool readADXL345(float &ax, float &ay, float &az) {
     }
 
     uint8_t data[6];
-    if (!readMultipleRegisters(adxlAddress, REG_DATAX0, data, 6)) {
+    if (!readMultipleRegistersSPI(REG_DATAX0, data, 6)) {
         return false;
     }
 
@@ -734,11 +709,14 @@ void setup() {
 
     Serial.println();
     Serial.println("==========================================================");
-    Serial.println("  Vibration Dosimeter — HAV Node Firmware v2.0             ");
+    Serial.println("  Vibration Dosimeter — HAV Node Firmware v2.0 (SPI/INT)   ");
     Serial.println("  Standards: ISO 5349-1 (HAV)                             ");
-    Serial.println("  Peripherals: ADXL345 + Wh Filter + BLE Server            ");
-    Serial.println("  Design Configuration: No RTC, no SD, no OLED             ");
+    Serial.println("  Peripherals: ADXL345 (SPI 5MHz) + Wh Filter + BLE Server ");
+    Serial.println("  Design Configuration: Custom PCB hardware-dosimeter Rev A");
     Serial.println("==========================================================");
+
+    // Store main task handle for FreeRTOS interrupt notification from isrADXLDataReady
+    s_mainTaskHandle = xTaskGetCurrentTaskHandle();
 
     // Initialize Mini RGB LED module (KY-016 / SMD 0805)
     if (rgb_led_init() == ESP_OK) {
@@ -759,13 +737,14 @@ void setup() {
     if (!adxlAvailable) {
         LOG_E("INIT", "ADXL345 HAV sensor initialization FAILED.");
         rgb_led_set_state(STATE_ERROR);
-        LOG_W("INIT", "Check wiring connections:");
-        LOG_W("INIT", "  - VCC -> 3V3");
+        LOG_W("INIT", "Check PCB connections:");
+        LOG_W("INIT", "  - VCC -> 3V3_SYS");
         LOG_W("INIT", "  - GND -> GND");
-        LOG_W("INIT", "  - SDA -> GPIO21");
-        LOG_W("INIT", "  - SCL -> GPIO22");
-        LOG_W("INIT", "  - CS  -> 3V3");
-        LOG_W("INIT", "  - SDO -> GND (for 0x53) or 3V3 (for 0x1D)");
+        LOG_W("INIT", "  - SCK -> GPIO18 (via R4 33R)");
+        LOG_W("INIT", "  - MISO-> GPIO19");
+        LOG_W("INIT", "  - MOSI-> GPIO23 (via R5 33R)");
+        LOG_W("INIT", "  - CS  -> GPIO25 (via R6 33R + R7 10k)");
+        LOG_W("INIT", "  - INT1-> GPIO35");
     } else {
         rgb_led_set_state(STATE_BLE_ADVERTISING);
     }
@@ -782,11 +761,9 @@ void setup() {
 // =============================================================================
 /**
  * @brief High-frequency main acquisition and filtering loop.
- *        Executes at exactly 3200 Hz using micros() timing control.
+ *        Synchronized with ADXL345 3200 Hz Data-Ready interrupt on GPIO35.
  */
 void loop() {
-    static uint64_t nextSampleTimeUsX100 = (uint64_t)micros() * 100ULL + SAMPLE_PERIOD_US_X100;
-
     static float sumX2 = 0.0f;
     static float sumY2 = 0.0f;
     static float sumZ2 = 0.0f;
@@ -798,90 +775,105 @@ void loop() {
 
     static uint32_t lastErrorPrintMs = 0;
 
-    const uint64_t nowUsX100 = (uint64_t)micros() * 100ULL;
+    float ax = 0.0f, ay = 0.0f, az = 0.0f;
 
-    if (nowUsX100 >= nextSampleTimeUsX100) {
-        nextSampleTimeUsX100 += SAMPLE_PERIOD_US_X100;
-
-        float ax = 0.0f, ay = 0.0f, az = 0.0f;
-
-        // ── Sensor Read ──────────────────────────────────────────────────────
+    // ── Sensor Acquisition (Hardware Interrupt vs Simulation) ───────────────
 #if SIMULATE_ADXL345
-        // Generate a 20 Hz sine wave for simulated HAV data, amplitude 1.5 m/s²
-        const float t = (float)nowUsX100 / 1000000.0f;
-        ax = 1.5f * sinf(2.0f * PI * 20.0f * t);
-        ay = 0.5f * cosf(2.0f * PI * 15.0f * t);
-        az = 0.2f * sinf(2.0f * PI * 10.0f * t);
+    static uint64_t nextSampleTimeUsX100 = (uint64_t)micros() * 100ULL + SAMPLE_PERIOD_US_X100;
+    const uint64_t nowUsX100 = (uint64_t)micros() * 100ULL;
+    if (nowUsX100 < nextSampleTimeUsX100) {
+        return;
+    }
+    nextSampleTimeUsX100 += SAMPLE_PERIOD_US_X100;
+
+    const float t = (float)nowUsX100 / 1000000.0f;
+    ax = 1.5f * sinf(2.0f * PI * 20.0f * t);
+    ay = 0.5f * cosf(2.0f * PI * 15.0f * t);
+    az = 0.2f * sinf(2.0f * PI * 10.0f * t);
 #else
-        if (!readADXL345(ax, ay, az)) {
-            const uint32_t nowMs = millis();
-            if (nowMs - lastErrorPrintMs >= 1000) {
-                lastErrorPrintMs = nowMs;
-                LOG_E("SENSOR", "ADXL345 HAV read failed! Retrying initialization...");
-                rgb_led_set_state(STATE_ERROR);
+    // Hardware Interrupt synchronization (Opsi 2 - INT1 Data Ready on GPIO35)
+    // ulTaskNotifyTake will block the loop until isrADXLDataReady() notifies on DATA_READY,
+    // with a 2ms timeout to avoid hard-locking if the sensor becomes disconnected.
+    const uint32_t notified = ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(2));
+    if (notified == 0 && !s_dataReadyFlag) {
+        const uint32_t nowMs = millis();
+        if (nowMs - lastErrorPrintMs >= 1000) {
+            lastErrorPrintMs = nowMs;
+            LOG_E("SENSOR", "ADXL345 INT1 timeout! Retrying initialization...");
+            rgb_led_set_state(STATE_ERROR);
 
-                // Attempt hardware sensor recovery
-                Wire.setClock(100000);
-                adxlAvailable = setupADXL345();
-                Wire.setClock(400000);
-
-                if (adxlAvailable) {
-                    rgb_led_set_state(bleClientConnected ? STATE_LOGGING_NORMAL : STATE_BLE_ADVERTISING);
-                }
+            adxlAvailable = setupADXL345();
+            if (adxlAvailable) {
+                rgb_led_set_state(bleClientConnected ? STATE_LOGGING_NORMAL : STATE_BLE_ADVERTISING);
             }
-            return;
         }
+        return;
+    }
+    s_dataReadyFlag = false;
+
+    if (!readADXL345(ax, ay, az)) {
+        const uint32_t nowMs = millis();
+        if (nowMs - lastErrorPrintMs >= 1000) {
+            lastErrorPrintMs = nowMs;
+            LOG_E("SENSOR", "ADXL345 HAV read failed! Retrying initialization...");
+            rgb_led_set_state(STATE_ERROR);
+
+            adxlAvailable = setupADXL345();
+            if (adxlAvailable) {
+                rgb_led_set_state(bleClientConnected ? STATE_LOGGING_NORMAL : STATE_BLE_ADVERTISING);
+            }
+        }
+        return;
+    }
 #endif
 
-        lastRawX = ax;
-        lastRawY = ay;
-        lastRawZ = az;
+    lastRawX = ax;
+    lastRawY = ay;
+    lastRawZ = az;
 
-        // ── Frequency Weighting: ISO 5349-1 Wh Weighting ─────────────────────
-        const float axWh = filterX.process(ax);
-        const float ayWh = filterY.process(ay);
-        const float azWh = filterZ.process(az);
+    // ── Frequency Weighting: ISO 5349-1 Wh Weighting ─────────────────────
+    const float axWh = filterX.process(ax);
+    const float ayWh = filterY.process(ay);
+    const float azWh = filterZ.process(az);
 
-        // ── RMS Accumulation ─────────────────────────────────────────────────
-        sumX2 += axWh * axWh;
-        sumY2 += ayWh * ayWh;
-        sumZ2 += azWh * azWh;
-        sampleCount++;
+    // ── RMS Accumulation ─────────────────────────────────────────────────
+    sumX2 += axWh * axWh;
+    sumY2 += ayWh * ayWh;
+    sumZ2 += azWh * azWh;
+    sampleCount++;
 
-        // ── 1-Second Epoch Boundary ──────────────────────────────────────────
-        if (sampleCount >= HAV_EPOCH_SAMPLES) {
-            const float ahwx = sqrtf(sumX2 / sampleCount);
-            const float ahwy = sqrtf(sumY2 / sampleCount);
-            const float ahwz = sqrtf(sumZ2 / sampleCount);
+    // ── 1-Second Epoch Boundary ──────────────────────────────────────────
+    if (sampleCount >= HAV_EPOCH_SAMPLES) {
+        const float ahwx = sqrtf(sumX2 / sampleCount);
+        const float ahwy = sqrtf(sumY2 / sampleCount);
+        const float ahwz = sqrtf(sumZ2 / sampleCount);
 
-            // ISO 5349-1 vector-sum: ahv = √(ahwx² + ahwy² + ahwz²)
-            const float ahv = sqrtf(ahwx * ahwx + ahwy * ahwy + ahwz * ahwz);
+        // ISO 5349-1 vector-sum: ahv = √(ahwx² + ahwy² + ahwz²)
+        const float ahv = sqrtf(ahwx * ahwx + ahwy * ahwy + ahwz * ahwz);
 
-            // Log raw axes data alongside the BLE transmission info
-            Serial.printf("RAW: ax=%.6f, ay=%.6f, az=%.6f | ", lastRawX, lastRawY, lastRawZ);
+        // Log raw axes data alongside the BLE transmission info
+        Serial.printf("RAW: ax=%.6f, ay=%.6f, az=%.6f | ", lastRawX, lastRawY, lastRawZ);
 
-            sendHavBlePacket(ahwx, ahwy, ahwz, ahv, sampleCount);
-
+        sendHavBlePacket(ahwx, ahwy, ahwz, ahv, sampleCount);
 
 #if ENABLE_BATTERY_MONITOR
-            // ── Periodic battery voltage monitoring (every 5 seconds) ─────────
-            static uint32_t lastBatteryCheckMs = 0;
-            const uint32_t nowMs = millis();
-            if (nowMs - lastBatteryCheckMs >= 5000) {
-                lastBatteryCheckMs = nowMs;
-                const float vbat = readBatteryVoltage();
-                if (vbat >= VBAT_MIN_VALID && vbat < VBAT_LOW_THRESHOLD) {
-                    LOG_W("PWR", "Low battery detected: %.2f V < %.2f V", vbat, VBAT_LOW_THRESHOLD);
-                    rgb_led_set_state(STATE_LOW_BATTERY);
-                }
+        // ── Periodic battery voltage monitoring (every 10 minutes) ─────────
+        static uint32_t lastBatteryCheckMs = 0;
+        const uint32_t nowMs = millis();
+        if (nowMs - lastBatteryCheckMs >= 600000) {
+            lastBatteryCheckMs = nowMs;
+            const float vbat = readBatteryVoltage();
+            if (vbat >= VBAT_MIN_VALID && vbat < VBAT_LOW_THRESHOLD) {
+                LOG_W("PWR", "Low battery detected: %.2f V < %.2f V", vbat, VBAT_LOW_THRESHOLD);
+                rgb_led_set_state(STATE_LOW_BATTERY);
             }
+        }
 #endif
 
-            // Reset accumulators
-            sumX2 = 0.0f;
-            sumY2 = 0.0f;
-            sumZ2 = 0.0f;
-            sampleCount = 0;
-        }
+        // Reset accumulators
+        sumX2 = 0.0f;
+        sumY2 = 0.0f;
+        sumZ2 = 0.0f;
+        sampleCount = 0;
     }
 }
